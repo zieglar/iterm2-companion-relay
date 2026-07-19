@@ -23,6 +23,7 @@ import { ShardMapStore } from "../src/sharding/shardMapStore.js";
 import { ShardMapPoller } from "../src/sharding/shardMapPoller.js";
 import { DrainScheduler } from "../src/sharding/drainScheduler.js";
 import { reshardReason, WS_RESHARD_CODE } from "../src/sharding/wireCodes.js";
+import { assertOriginMatches } from "../src/sharding/origin.js";
 import { SHARDMAP_POLL_INTERVAL_MS, RESHARD_DRAIN_DELAY_MS, RESHARD_EVICTION_RATE } from "../src/sharding/params.js";
 
 // Ceiling on a single buffered frame. Above room.js's own MAX_FRAME_BYTES
@@ -248,6 +249,12 @@ export function createRelay(options = {}) {
   // store kept current by a poller; a store may be injected (tests), otherwise it
   // is built from config (shardMapUrl + selfHost) with its own poller.
   const shardMode = resolveMode(cfg);
+  if (shardMode !== MODE_DIRECT) {
+    // Appendix A #7: the proof origin, the map/cert host, and this box's identity
+    // are one string. Fail fast if RELAY_ORIGIN and selfHost disagree, or every
+    // signed join for this box's buckets would fail.
+    assertOriginMatches((cfg.env && cfg.env.RELAY_ORIGIN) || "", cfg.selfHost);
+  }
   let shardStore = cfg.shardMapStore || null;
   let shardPoller = null;
   let shardDrain = null;
