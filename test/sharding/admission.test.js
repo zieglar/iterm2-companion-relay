@@ -54,12 +54,6 @@ describe("ownershipDecision: distributed mode", () => {
   });
 });
 
-// Server-integration ordering guarantees (§6.5): these need host/server.js to
-// call the gate before the limiter/body/attest, with injectable seams to observe
-// non-invocation. Pending the server refactor (next TDD slice).
-describe("ownership gate ordering (server integration)", () => {
-  it.todo("rejects a non-owned WS upgrade before the 101 handshake");
-  it.todo("rejects /attest before charging the /attest rate limiter");
-  it.todo("rejects /register and /delete before reading the request body");
-  it.todo("does not run App Attest verification on a non-owned /attest");
-});
+// The server-integration ordering guarantees (reject BEFORE the 101 / the attest
+// limiter / the body read) are exercised end-to-end against a booted host in
+// test/host/shardGate.test.js.

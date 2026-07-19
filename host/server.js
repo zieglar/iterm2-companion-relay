@@ -17,6 +17,8 @@ import { Metrics } from "./metrics.js";
 import { startMetricsPush } from "./metricspush.js";
 import { Room } from "../src/room.js";
 import { entryReject, ROOM_HEADER } from "../src/index.js";
+import { resolveMode, MODE_DIRECT } from "../src/sharding/mode.js";
+import { ownershipDecision } from "../src/sharding/admission.js";
 
 // Ceiling on a single buffered frame. Above room.js's own MAX_FRAME_BYTES
 // (256 KiB) so room.js still makes the semantic close(1009) decision, but low
@@ -169,7 +171,8 @@ function readBody(req, limit) {
 }
 
 const STATUS_TEXT = {
-  400: "Bad Request", 403: "Forbidden", 429: "Too Many Requests",
+  400: "Bad Request", 403: "Forbidden", 421: "Misdirected Request",
+  429: "Too Many Requests",
   500: "Internal Server Error", 503: "Service Unavailable",
 };
 
@@ -227,6 +230,22 @@ export function createRelay(options = {}) {
   // A falsy limit config disables that limiter entirely (mirrors the old
   // deployment where the rate-limit binding was optional): the deployment still
   // serves, unthrottled, rather than failing.
+  // Sharding mode gate (§6.5). Direct mode (self-host) owns every bucket, so this
+  // is a no-op; distributed mode consults the injected shard-map store to reject
+  // buckets this box does not own (reject-on-doubt).
+  const shardMode = resolveMode(cfg);
+  const shardStore = cfg.shardMapStore || null;
+  if (shardMode !== MODE_DIRECT && !shardStore) {
+    throw new Error("distributed mode requires a shard-map store (cfg.shardMapStore)");
+  }
+  metrics.inc("shard_reject_total", 0); // pre-register so it always appears
+  function ownershipGate(room) {
+    if (shardMode === MODE_DIRECT) return { admit: true };
+    return ownershipDecision({
+      mode: shardMode, roomName: room, ownsBucket: (b) => shardStore.ownsBucket(b),
+    });
+  }
+
   const attestOver = cfg.attestLimit ? makeLimiter(cfg.attestLimit) : () => false;
   const wsOver = cfg.wsLimit ? makeLimiter(cfg.wsLimit) : () => false;
 
@@ -271,11 +290,20 @@ export function createRelay(options = {}) {
       if (rej) return sendPlain(res, rej.status, rej.message);
 
       metrics.inc("http_requests_total");
+      const room = headers.get(ROOM_HEADER);
+      // Reject-on-doubt (§6.5): a bucket this box does not own is refused with 421
+      // BEFORE the attest limiter and the body read, so a stale-map bounce is
+      // neither an attestation failure nor a drain on the limiter. No-op in direct
+      // mode. /metrics is handled above (no room header), so it is never gated.
+      const httpGate = ownershipGate(room);
+      if (!httpGate.admit) {
+        metrics.inc("shard_reject_total");
+        return sendPlain(res, httpGate.status, "misdirected");
+      }
       const ip = clientIp(headers, req.socket, cfg);
       if (url.pathname.startsWith("/attest") && attestOver(ip)) {
         return sendPlain(res, 429, "rate limited");
       }
-      const room = headers.get(ROOM_HEADER);
       // Check-then-act: a burst of concurrent new-room requests can each pass
       // this before any creates its room, overshooting maxRooms by the
       // concurrency width. Acceptable — the cap is a soft memory bound, not a
@@ -354,6 +382,13 @@ export function createRelay(options = {}) {
     // memory bounds; the counters are decremented on close and self-correct.
     if (totalSockets >= cfg.maxTotalSockets) return reject(socket, 503, "capacity", "total_cap");
     const room = headers.get(ROOM_HEADER);
+    // Reject-on-doubt (§6.5): refuse a non-owned bucket with 421 before the 101,
+    // so the client re-resolves. No-op in direct mode.
+    const wsGate = ownershipGate(room);
+    if (!wsGate.admit) {
+      metrics.inc("shard_reject_total");
+      return abortUpgrade(socket, wsGate.status, "misdirected");
+    }
     if (!runtime.rooms.has(room) && runtime.size >= cfg.maxRooms) {
       return reject(socket, 503, "capacity", "room_cap");
     }
