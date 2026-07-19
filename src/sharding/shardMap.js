@@ -1,8 +1,6 @@
 // Distributed-mode only: the parsed, validated shard map (bucket ranges -> host)
 // and bucket -> host lookup. Mirrors Swift's ShardMap so both sides agree on
 // what a well-formed map is. See docs/companion-relay-design.md (§6.2, §6.3).
-//
-// STUB: not yet implemented (tests are written first, TDD red).
 
 // The immutable bucket count. Fixed forever (Appendix A invariant 1); the map
 // does not carry it.
@@ -28,26 +26,67 @@ export class ShardMapValidationError extends Error {
   }
 }
 
-// parseShardMap(text: string) -> { version: number, ranges: [{low,high,host}] }
-// Parses JSON and checks structural shape (numeric version, ranges array of
-// {low:number, high:number, host:string}). Throws ShardMapValidationError
-// {kind: "malformed"} on bad JSON or wrong shape. Does NOT check the partition;
-// call validateShardMap() for that.
+const isInt = (x) => typeof x === "number" && Number.isInteger(x);
+
+// parseShardMap(text) -> { version, ranges: [{low,high,host}] }. Throws
+// ShardMapValidationError {kind: "malformed"} on bad JSON or wrong shape. Does
+// NOT check the partition; call validateShardMap() for that.
 export function parseShardMap(text) {
-  throw new Error("not implemented: parseShardMap");
+  let obj;
+  try {
+    obj = JSON.parse(text);
+  } catch {
+    throw new ShardMapValidationError(ShardMapError.malformed, "invalid JSON");
+  }
+  if (typeof obj !== "object" || obj === null || Array.isArray(obj)) {
+    throw new ShardMapValidationError(ShardMapError.malformed, "not an object");
+  }
+  if (!isInt(obj.version)) {
+    throw new ShardMapValidationError(ShardMapError.malformed, "version must be an integer");
+  }
+  if (!Array.isArray(obj.ranges)) {
+    throw new ShardMapValidationError(ShardMapError.malformed, "ranges must be an array");
+  }
+  const ranges = obj.ranges.map((r) => {
+    if (typeof r !== "object" || r === null || !isInt(r.low) || !isInt(r.high) || typeof r.host !== "string") {
+      throw new ShardMapValidationError(ShardMapError.malformed, "bad range entry");
+    }
+    return { low: r.low, high: r.high, host: r.host };
+  });
+  return { version: obj.version, ranges };
 }
 
-// validateShardMap(map) -> void; throws ShardMapValidationError on:
-//  - version < 0                          -> negativeVersion
-//  - no ranges                            -> emptyRanges
-//  - a range with an empty host           -> emptyHost
-//  - low > high, or out of [0, N-1]       -> invalidRange
-//  - ranges do not exactly tile [0, N-1]  -> gapOrOverlap
+// validateShardMap(map) -> void; throws ShardMapValidationError. Version >= 0,
+// at least one range, every range in-bounds with a non-empty host, and the
+// ranges exactly tiling [0, EXPECTED_BUCKETS - 1].
 export function validateShardMap(map) {
-  throw new Error("not implemented: validateShardMap");
+  if (map.version < 0) throw new ShardMapValidationError(ShardMapError.negativeVersion);
+  if (!Array.isArray(map.ranges) || map.ranges.length === 0) {
+    throw new ShardMapValidationError(ShardMapError.emptyRanges);
+  }
+  for (const r of map.ranges) {
+    if (r.host === "") throw new ShardMapValidationError(ShardMapError.emptyHost);
+    if (r.low > r.high || r.low < 0 || r.high >= EXPECTED_BUCKETS) {
+      throw new ShardMapValidationError(ShardMapError.invalidRange, `${r.low}..${r.high}`);
+    }
+  }
+  // Sort by low and walk: must start at 0, each next exactly one past the
+  // previous (a larger low is a gap, a smaller-or-equal one an overlap), and the
+  // last must end at EXPECTED_BUCKETS - 1.
+  const sorted = [...map.ranges].sort((a, b) => a.low - b.low);
+  let expectedNext = 0;
+  for (const r of sorted) {
+    if (r.low !== expectedNext) throw new ShardMapValidationError(ShardMapError.gapOrOverlap);
+    expectedNext = r.high + 1;
+  }
+  if (expectedNext !== EXPECTED_BUCKETS) throw new ShardMapValidationError(ShardMapError.gapOrOverlap);
 }
 
 // hostForBucket(map, bucket) -> host string, or null if out of range / uncovered.
 export function hostForBucket(map, bucket) {
-  throw new Error("not implemented: hostForBucket");
+  if (bucket < 0 || bucket >= EXPECTED_BUCKETS) return null;
+  for (const r of map.ranges) {
+    if (bucket >= r.low && bucket <= r.high) return r.host;
+  }
+  return null;
 }

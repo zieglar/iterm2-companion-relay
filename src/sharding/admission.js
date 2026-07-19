@@ -8,22 +8,22 @@
 // or charging the /attest rate limiter, so a stale-map bounce is neither an
 // attest failure nor a limiter drain (that ordering is a server-integration
 // concern, marked it.todo in the test).
-//
-// STUB: not yet implemented (tests are written first, TDD red).
 
-// eslint-disable-next-line no-unused-vars
 import { bucketForRoomName } from "./room.js";
-import { MODE_DIRECT, MODE_DISTRIBUTED } from "./mode.js";
+import { MODE_DIRECT } from "./mode.js";
 
 export const REJECT_STATUS = 421;
 
 // ownershipDecision({ mode, roomName, ownsBucket }) -> decision
-//   direct mode  -> { admit: true }  (owns every bucket; never rejects)
-//   distributed  -> derive bucket from roomName, then:
-//     - roomName not bucketable      -> { admit: false, status: 421, reason: "unroutable", bucket: null }
-//     - ownsBucket(bucket) is false  -> { admit: false, status: 421, reason: "not-owner", bucket }
-//     - ownsBucket(bucket) is true   -> { admit: true, bucket }
-// `ownsBucket` is a (bucket:number)->boolean predicate (e.g. ShardMapStore.ownsBucket).
+//   direct mode -> { admit: true } (owns every bucket; never rejects)
+//   distributed -> derive the bucket, then admit iff ownsBucket(bucket).
 export function ownershipDecision({ mode, roomName, ownsBucket }) {
-  throw new Error("not implemented: ownershipDecision");
+  if (mode === MODE_DIRECT) return { admit: true };
+
+  const bucket = bucketForRoomName(roomName);
+  if (bucket === null) {
+    return { admit: false, status: REJECT_STATUS, reason: "unroutable", bucket: null };
+  }
+  if (ownsBucket(bucket)) return { admit: true, bucket };
+  return { admit: false, status: REJECT_STATUS, reason: "not-owner", bucket };
 }

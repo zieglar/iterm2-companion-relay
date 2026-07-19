@@ -7,15 +7,19 @@
 // half-enable sharding: distributed requires BOTH a shard-map URL and a
 // self-identity host; neither means direct; exactly one is a misconfiguration.
 // See docs/companion-relay-design.md (§6.1, §6.8, §6.10).
-//
-// STUB: not yet implemented (tests are written first, TDD red).
 
 export const MODE_DIRECT = "direct";
 export const MODE_DISTRIBUTED = "distributed";
 
 // resolveMode(config) -> "direct" | "distributed"
-// config: { shardMapUrl?: string, selfHost?: string, ... }. A missing or
-// empty-string value counts as absent. Throws if exactly one is present.
+// A missing or empty-string value counts as absent. Throws if exactly one of
+// shardMapUrl / selfHost is present (fail fast on a misconfiguration).
 export function resolveMode(config) {
-  throw new Error("not implemented: resolveMode");
+  const hasUrl = Boolean(config && config.shardMapUrl);
+  const hasHost = Boolean(config && config.selfHost);
+  if (hasUrl && hasHost) return MODE_DISTRIBUTED;
+  if (!hasUrl && !hasHost) return MODE_DIRECT;
+  throw new Error(
+    "distributed mode requires BOTH shardMapUrl and selfHost; " +
+    `got shardMapUrl=${hasUrl ? "set" : "unset"}, selfHost=${hasHost ? "set" : "unset"}`);
 }

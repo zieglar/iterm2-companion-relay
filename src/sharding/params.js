@@ -1,8 +1,6 @@
 // Distributed-mode tunables and the orderings the §6-§7 correctness arguments
 // depend on. The numbers are operator-tunable; the relationships between them are
 // not. See docs/companion-relay-design.md Appendix C.
-//
-// Defaults are real values (a spec lock); validateParams is the stub under test.
 
 // CDN Cache-Control max-age on shardmap.json (a publish setting, not relay code).
 export const SHARDMAP_TTL_MS = 5_000;
@@ -18,12 +16,20 @@ export const RECONNECT_JITTER_INITIAL_MS = 3_000;
 export const RECONNECT_BACKOFF_BASE_MS = 1_000;
 export const RECONNECT_BACKOFF_CAP_MS = 30_000;
 
-// validateParams({ ttlMs, pollMs, drainDelayMs, evictionRate }) -> void
-// Throws if an operator override breaks an invariant:
-//   - ttlMs < pollMs                (a poll usually revalidates fresh)
-//   - drainDelayMs >= 2 * pollMs     (covers worst-case poll-phase skew)
-//   - evictionRate > 0
-// The thrown error carries `.kind` in {"ttlNotBelowPoll","drainDelayTooShort","nonPositiveRate"}.
+const invariant = (ok, kind, message) => {
+  if (ok) return;
+  const e = new Error(message);
+  e.kind = kind;
+  throw e;
+};
+
+// validateParams({ ttlMs, pollMs, drainDelayMs, evictionRate }) -> void. Throws
+// (with .kind) if an operator override breaks an invariant.
 export function validateParams({ ttlMs, pollMs, drainDelayMs, evictionRate }) {
-  throw new Error("not implemented: validateParams");
+  invariant(ttlMs < pollMs, "ttlNotBelowPoll",
+    `SHARDMAP_TTL_MS (${ttlMs}) must be below SHARDMAP_POLL_INTERVAL_MS (${pollMs})`);
+  invariant(drainDelayMs >= 2 * pollMs, "drainDelayTooShort",
+    `RESHARD_DRAIN_DELAY_MS (${drainDelayMs}) must be >= 2x the poll interval (${2 * pollMs})`);
+  invariant(evictionRate > 0, "nonPositiveRate",
+    `RESHARD_EVICTION_RATE (${evictionRate}) must be positive`);
 }

@@ -9,51 +9,49 @@
 //  - Own-nothing is valid: a map that assigns this host zero buckets is adopted
 //    (drain to empty), which is distinct from having no map yet.
 //
-// The store composes ownedBuckets()/diffOwned() and emits the acquired/
-// relinquished diff on each adopt so the caller can start accepting / schedule
-// drains. See docs/companion-relay-design.md (§6.5, §6.6, §6.8).
-//
-// STUB: not yet implemented (tests are written first, TDD red).
+// See docs/companion-relay-design.md (§6.5, §6.6, §6.8).
 
-// eslint-disable-next-line no-unused-vars
 import { ownedBuckets, diffOwned } from "./ownedSet.js";
 
+const EMPTY_DIFF = () => ({ adopted: false, acquired: new Set(), relinquished: new Set() });
+
 export class ShardMapStore {
-  // constructor({ selfHost }): selfHost is this box's provisioned identity, the
-  // `host` string it matches in the map.
   constructor({ selfHost }) {
-    throw new Error("not implemented: ShardMapStore");
+    this._selfHost = selfHost;
+    this._map = null;
+    this._owned = new Set();
   }
 
-  // The adopted map's version, or -1 when no map has been adopted yet.
   get version() {
-    throw new Error("not implemented: version");
+    return this._map ? this._map.version : -1;
   }
 
-  // True once any map has been adopted (distinguishes own-nothing from no-map).
   get hasMap() {
-    throw new Error("not implemented: hasMap");
+    return this._map !== null;
   }
 
-  // applyFetched(validatedMap) -> { adopted: boolean, acquired: Set, relinquished: Set }
-  // Adopt iff version strictly increases. On a non-adopt, acquired/relinquished
-  // are empty and state is unchanged.
+  // applyFetched(validatedMap) -> { adopted, acquired, relinquished }
   applyFetched(validatedMap) {
-    throw new Error("not implemented: applyFetched");
+    if (this._map && validatedMap.version <= this._map.version) {
+      return EMPTY_DIFF(); // monotonic: ignore equal-or-older
+    }
+    const newOwned = ownedBuckets(validatedMap, this._selfHost);
+    const { acquired, relinquished } = diffOwned(this._owned, newOwned);
+    this._map = validatedMap;
+    this._owned = newOwned;
+    return { adopted: true, acquired, relinquished };
   }
 
   // applyFetchError() -> void. Keep last-known-good; no state change.
   applyFetchError() {
-    throw new Error("not implemented: applyFetchError");
+    /* deliberately nothing: hold the current map */
   }
 
-  // ownsBucket(bucket) -> boolean, against the currently adopted map.
   ownsBucket(bucket) {
-    throw new Error("not implemented: ownsBucket");
+    return this._owned.has(bucket);
   }
 
-  // ownedBuckets() -> Set<number>, a copy of the current owned set.
   ownedBuckets() {
-    throw new Error("not implemented: ownedBuckets");
+    return new Set(this._owned);
   }
 }

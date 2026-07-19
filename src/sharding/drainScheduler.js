@@ -13,39 +13,54 @@
 // gate (admission.js), not here; this scheduler only drains EXISTING splices.
 //
 // Time is injected (`now()` returns ms) so tests use a virtual clock and never
-// sleep. Token bucket: tokens accrue at `evictionRatePerSec`, capped at one
-// second's worth, and are spent only on rooms of past-deadline buckets.
-//
-// STUB: not yet implemented (tests are written first, TDD red).
+// sleep. Token bucket: tokens accrue at `evictionRatePerSec` (capped at one
+// second's worth) from construction, and are spent only on rooms of
+// past-deadline buckets, so the drain starts with at most one second's burst and
+// then paces at the rate.
 
 export class DrainScheduler {
-  // { drainDelayMs, evictionRatePerSec, now, evict, liveRooms }
-  //   now()            -> current time in ms
-  //   evict(roomId)    -> close the room's two sockets (called once per room)
-  //   liveRooms(bucket)-> array of live room ids currently in that bucket
   constructor({ drainDelayMs, evictionRatePerSec, now, evict, liveRooms }) {
-    throw new Error("not implemented: DrainScheduler");
+    this._drainDelayMs = drainDelayMs;
+    this._rate = evictionRatePerSec;
+    this._now = now;
+    this._evict = evict;
+    this._liveRooms = liveRooms;
+    this._draining = new Map(); // bucket -> deadline ms
+    this._evicted = new Set();  // room ids already evicted (never re-evict)
+    this._tokens = 0;
+    this._lastRunMs = now();
   }
 
-  // Mark a bucket as relinquished; deadline = now() + drainDelayMs. Calling it
-  // again for the same bucket recomputes the deadline from the latest call.
   relinquish(bucket) {
-    throw new Error("not implemented: relinquish");
+    this._draining.set(bucket, this._now() + this._drainDelayMs);
   }
 
-  // Cancel draining for a bucket (it is ours again); its live rooms stay.
   reacquire(bucket) {
-    throw new Error("not implemented: reacquire");
+    this._draining.delete(bucket);
   }
 
-  // Advance to now() and evict eligible rooms up to the rate. Returns the list of
-  // room ids evicted on this call.
   run() {
-    throw new Error("not implemented: run");
+    const t = this._now();
+    this._tokens = Math.min(this._rate, this._tokens + ((t - this._lastRunMs) * this._rate) / 1000);
+    this._lastRunMs = t;
+
+    const evicted = [];
+    for (const [bucket, deadline] of this._draining) {
+      if (deadline > t) continue; // still deferring this bucket
+      for (const id of this._liveRooms(bucket)) {
+        if (this._tokens < 1) break;
+        if (this._evicted.has(id)) continue;
+        this._tokens -= 1;
+        this._evicted.add(id);
+        this._evict(id);
+        evicted.push(id);
+      }
+      if (this._tokens < 1) break; // global rate: stop scanning further buckets
+    }
+    return evicted;
   }
 
-  // The set of buckets currently draining (for introspection / tests).
   get drainingBuckets() {
-    throw new Error("not implemented: drainingBuckets");
+    return new Set(this._draining.keys());
   }
 }
