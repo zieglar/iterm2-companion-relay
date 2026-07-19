@@ -281,7 +281,9 @@ export function createRelay(options = {}) {
     const drainMs = cfg.drainDelayMs ?? RESHARD_DRAIN_DELAY_MS;
     const rate = cfg.evictionRate ?? RESHARD_EVICTION_RATE;
     // §7.4: the drain must defer at least two poll intervals; fail fast on a bad
-    // operator override rather than risk bouncing clients between hosts.
+    // operator override rather than risk bouncing clients between hosts. This is
+    // the relay-relevant subset of params.validateParams; the TTL<poll invariant
+    // is a CDN publish setting, enforced where the map is published, not here.
     if (drainMs < 2 * pollMs) {
       throw new Error(`drainDelayMs (${drainMs}) must be >= 2x pollIntervalMs (${pollMs})`);
     }
@@ -319,9 +321,23 @@ export function createRelay(options = {}) {
   // map is adopted: accepting with an empty owned set would 421 every bucket.
   async function bootstrapShardMap() {
     if (!shardPoller) return; // direct mode, or an injected store the caller owns
+    // Bounded so a cold boot during a CDN outage fails cleanly (systemd restarts)
+    // rather than hanging "running" but never listening. Generous by default, so a
+    // brief blip is absorbed; last-known-good cannot help a cold boot.
+    const maxRetries = cfg.bootMaxRetries ?? 60;
+    let attempts = 0;
     while (!shardStore.hasMap) {
       await shardPoller.fetchOnce();
       if (shardStore.hasMap) break;
+      attempts += 1;
+      if (attempts >= maxRetries) {
+        throw new Error(
+          `shard map fetch failed after ${attempts} attempts; refusing to accept ` +
+          "connections without ownership (§6.5)");
+      }
+      if (cfg.env && cfg.env.RELAY_LOG === "true") {
+        console.warn(`relay: shard map not available (attempt ${attempts}/${maxRetries}); retrying`);
+      }
       await bootSleep(cfg.bootRetryMs ?? 1000);
     }
     shardPoller.start(cfg.pollIntervalMs ?? SHARDMAP_POLL_INTERVAL_MS);
@@ -465,6 +481,17 @@ export function createRelay(options = {}) {
     const rej = entryReject(headers);
     if (rej) return reject(socket, rej.status, rej.message, "gate");
 
+    const room = headers.get(ROOM_HEADER);
+    // Reject-on-doubt (§6.5) BEFORE the rate/cap checks: a non-owned bucket must
+    // get 421 (re-resolve), not a 429 (stay here) it would get if the per-IP ws
+    // limiter fired first during a reshard reconnect. The gate is cheap (a hash
+    // slice + set lookup) and allocates no socket. No-op in direct mode.
+    const wsGate = ownershipGate(room);
+    if (!wsGate.admit) {
+      metrics.inc("shard_reject_total");
+      return abortUpgrade(socket, wsGate.status, "misdirected");
+    }
+
     const ip = clientIp(headers, socket, cfg);
     if (wsOver(ip)) return reject(socket, 429, "rate limited", "rate_limited");
     if ((ipSockets.get(ip) || 0) >= cfg.maxSocketsPerIp) {
@@ -474,14 +501,6 @@ export function createRelay(options = {}) {
     // these totals by the in-flight count before any increments. Fine — soft
     // memory bounds; the counters are decremented on close and self-correct.
     if (totalSockets >= cfg.maxTotalSockets) return reject(socket, 503, "capacity", "total_cap");
-    const room = headers.get(ROOM_HEADER);
-    // Reject-on-doubt (§6.5): refuse a non-owned bucket with 421 before the 101,
-    // so the client re-resolves. No-op in direct mode.
-    const wsGate = ownershipGate(room);
-    if (!wsGate.admit) {
-      metrics.inc("shard_reject_total");
-      return abortUpgrade(socket, wsGate.status, "misdirected");
-    }
     if (!runtime.rooms.has(room) && runtime.size >= cfg.maxRooms) {
       return reject(socket, 503, "capacity", "room_cap");
     }

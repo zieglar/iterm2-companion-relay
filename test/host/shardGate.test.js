@@ -83,6 +83,16 @@ describe("distributed mode: reject-on-doubt on the data plane", () => {
     });
   });
 
+  it("prefers 421 (re-resolve) over 429 (retry-here) for a non-owned WS reconnect", async () => {
+    // Per-IP ws limiter of 1: if it were charged before the ownership gate, the
+    // second non-owned upgrade from the same IP would get 429 (stay here). The
+    // gate must win, so both get 421 (re-resolve) during a reshard.
+    await withRelay({ ...DISTRIBUTED, wsLimit: { limit: 1, windowMs: 60_000 } }, async ({ wsBase }) => {
+      expect(await wsAttempt(wsBase, UNOWNED_ROOM)).toEqual({ status: 421 });
+      expect(await wsAttempt(wsBase, UNOWNED_ROOM)).toEqual({ status: 421 });
+    });
+  });
+
   it("checks ownership BEFORE reading the body (oversized body -> 421, not 413)", async () => {
     await withRelay(DISTRIBUTED, async ({ base }) => {
       const big = "x".repeat(80 * 1024); // over MAX_BODY_BYTES (64 KiB)

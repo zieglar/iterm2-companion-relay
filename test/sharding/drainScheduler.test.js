@@ -100,6 +100,37 @@ describe("DrainScheduler: cancel on re-acquire", () => {
   });
 });
 
+describe("DrainScheduler: re-relinquish after a bucket ping-pongs back", () => {
+  it("evicts a room again when its bucket is relinquished a second time", () => {
+    const h = harness({ drainDelayMs: 20_000, evictionRatePerSec: 10 });
+    h.addRooms(1, ["1:P"]);
+    h.sched.relinquish(1);
+    h.setTime(21_000); h.sched.run();
+    expect(h.evicted).toEqual(["1:P"]); // first eviction
+
+    // The map returns bucket 1 to this host, and the pairing re-forms here with
+    // the same deterministic room name.
+    h.sched.reacquire(1);
+    h.addRooms(1, ["1:P"]);
+
+    // Bucket 1 is relinquished again: the re-formed room MUST drain again, not be
+    // stranded because it was evicted in a prior episode.
+    h.setTime(30_000); h.sched.relinquish(1);
+    h.setTime(51_000); h.sched.run();
+    expect(h.evicted).toEqual(["1:P", "1:P"]);
+  });
+
+  it("does not leak evicted room names for a bucket once it is re-acquired", () => {
+    const h = harness({ drainDelayMs: 20_000, evictionRatePerSec: 10 });
+    h.addRooms(1, ["1:P"]);
+    h.sched.relinquish(1);
+    h.setTime(21_000); h.sched.run();
+    h.sched.reacquire(1);
+    // After re-acquire nothing about bucket 1 is retained (no draining entry).
+    expect(h.sched.drainingBuckets.has(1)).toBe(false);
+  });
+});
+
 describe("DrainScheduler: recompute deadline", () => {
   it("resets the deadline when a bucket is relinquished again", () => {
     const h = harness({ drainDelayMs: 20_000, evictionRatePerSec: 10 });

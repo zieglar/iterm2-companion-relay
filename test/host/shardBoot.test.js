@@ -69,6 +69,20 @@ describe("distributed boot", () => {
     }
   });
 
+  it("fails to start (bounded) when the map never fetches, instead of hanging", async () => {
+    const relay = createRelay({
+      env: { RELAY_ORIGIN: "https://relay1", RELAY_LOG: "false" },
+      dbPath: ":memory:",
+      shardMapUrl: "https://cdn/shardmap.json",
+      selfHost: "relay1",
+      fetchText: async () => { throw new Error("ECONNREFUSED"); },
+      bootSleep: async () => {},
+      bootMaxRetries: 3,
+    });
+    await expect(relay.listen(0, "127.0.0.1")).rejects.toThrow();
+    await relay.close().catch(() => {});
+  });
+
   it("retries the boot fetch until the first map is adopted", async () => {
     let calls = 0;
     const fetchText = async () => {

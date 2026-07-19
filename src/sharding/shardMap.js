@@ -11,10 +11,26 @@ export const ShardMapError = {
   negativeVersion: "negativeVersion",
   emptyRanges: "emptyRanges",
   emptyHost: "emptyHost",
+  invalidHost: "invalidHost",
   invalidRange: "invalidRange",
   gapOrOverlap: "gapOrOverlap",
   malformed: "malformed",
 };
+
+// A bare authority (§6.3/§6.10): the same string is the client's connect target,
+// the cert SAN, and the signed proof origin ("https://" + host), so it must carry
+// no scheme/path/userinfo/query/fragment, be lowercase, and have no trailing dot.
+// Accepts a DNS name, an IPv4 literal, or a bracketed IPv6 authority, with an
+// optional :port. Deliberately permissive on the character set otherwise (the
+// map is operator-authored); this only closes the "https://relay1" / uppercase /
+// trailing-dot traps that silently break every proof for that host's buckets.
+function isBareAuthority(host) {
+  if (typeof host !== "string" || host.length === 0) return false;
+  if (/[/@?#\s]/.test(host)) return false; // scheme (//), path, userinfo, query, fragment, whitespace
+  if (/[A-Z]/.test(host)) return false;    // lowercase only
+  if (host.endsWith(".")) return false;    // no trailing dot
+  return true;
+}
 
 // A thrown validation/parse error carries `.kind` (one of ShardMapError) so
 // tests and callers can branch without string-matching a message.
@@ -66,6 +82,7 @@ export function validateShardMap(map) {
   }
   for (const r of map.ranges) {
     if (r.host === "") throw new ShardMapValidationError(ShardMapError.emptyHost);
+    if (!isBareAuthority(r.host)) throw new ShardMapValidationError(ShardMapError.invalidHost, r.host);
     if (r.low > r.high || r.low < 0 || r.high >= EXPECTED_BUCKETS) {
       throw new ShardMapValidationError(ShardMapError.invalidRange, `${r.low}..${r.high}`);
     }

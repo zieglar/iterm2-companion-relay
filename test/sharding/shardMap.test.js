@@ -106,6 +106,28 @@ describe("validateShardMap: rejected shapes", () => {
   });
 });
 
+describe("validateShardMap: host must be a bare authority (§6.3/§6.10)", () => {
+  const withHost = (host) => map(1, [r(0, N - 1, host)]);
+
+  it("accepts a DNS name, IPv4, bracketed IPv6, and an explicit port", () => {
+    for (const h of ["relay1.iterm2.com", "relay1", "203.0.113.7",
+                     "relay1.iterm2.com:8443", "[2001:db8::1]:8443"]) {
+      expect(() => validateShardMap(withHost(h)), h).not.toThrow();
+    }
+  });
+
+  it("rejects a scheme, path, userinfo, query, fragment, or whitespace", () => {
+    for (const h of ["https://relay1", "relay1/x", "user@relay1", "relay1?x", "relay1#x", "relay1 x"]) {
+      expectKind(withHost(h), ShardMapError.invalidHost);
+    }
+  });
+
+  it("rejects uppercase and a trailing dot (must match cert SAN / proof origin verbatim)", () => {
+    expectKind(withHost("Relay1.iterm2.com"), ShardMapError.invalidHost);
+    expectKind(withHost("relay1.iterm2.com."), ShardMapError.invalidHost);
+  });
+});
+
 describe("hostForBucket", () => {
   const m = map(1, [r(0, 32767, "relay1.iterm2.com"), r(32768, N - 1, "relay2.iterm2.com")]);
   it("returns the owning host at range boundaries", () => {

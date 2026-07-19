@@ -25,18 +25,24 @@ export class DrainScheduler {
     this._now = now;
     this._evict = evict;
     this._liveRooms = liveRooms;
-    this._draining = new Map(); // bucket -> deadline ms
-    this._evicted = new Set();  // room ids already evicted (never re-evict)
+    // bucket -> { deadline, evicted: Set }. The evicted set is scoped to THIS
+    // drain episode (idempotency within the episode when liveRooms lingers), not
+    // the process: a fresh relinquish starts a fresh episode, and reacquire drops
+    // it, so a bucket that ping-pongs back and is relinquished again drains its
+    // re-formed rooms instead of being stranded, and nothing leaks past a drain.
+    this._draining = new Map();
     this._tokens = 0;
     this._lastRunMs = now();
   }
 
   relinquish(bucket) {
-    this._draining.set(bucket, this._now() + this._drainDelayMs);
+    // A new episode: fresh deadline and a fresh evicted set (so a re-relinquished
+    // bucket re-evicts, and a recomputed deadline restarts cleanly).
+    this._draining.set(bucket, { deadline: this._now() + this._drainDelayMs, evicted: new Set() });
   }
 
   reacquire(bucket) {
-    this._draining.delete(bucket);
+    this._draining.delete(bucket); // drops the episode and its evicted set
   }
 
   run() {
@@ -45,13 +51,13 @@ export class DrainScheduler {
     this._lastRunMs = t;
 
     const evicted = [];
-    for (const [bucket, deadline] of this._draining) {
-      if (deadline > t) continue; // still deferring this bucket
+    for (const [bucket, ep] of this._draining) {
+      if (ep.deadline > t) continue; // still deferring this bucket
       for (const id of this._liveRooms(bucket)) {
         if (this._tokens < 1) break;
-        if (this._evicted.has(id)) continue;
+        if (ep.evicted.has(id)) continue; // already evicted in THIS episode
         this._tokens -= 1;
-        this._evicted.add(id);
+        ep.evicted.add(id);
         this._evict(id);
         evicted.push(id);
       }
