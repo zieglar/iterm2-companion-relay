@@ -21,7 +21,9 @@ import { resolveMode, MODE_DIRECT } from "../src/sharding/mode.js";
 import { ownershipDecision } from "../src/sharding/admission.js";
 import { ShardMapStore } from "../src/sharding/shardMapStore.js";
 import { ShardMapPoller } from "../src/sharding/shardMapPoller.js";
-import { SHARDMAP_POLL_INTERVAL_MS } from "../src/sharding/params.js";
+import { DrainScheduler } from "../src/sharding/drainScheduler.js";
+import { reshardReason, WS_RESHARD_CODE } from "../src/sharding/wireCodes.js";
+import { SHARDMAP_POLL_INTERVAL_MS, RESHARD_DRAIN_DELAY_MS, RESHARD_EVICTION_RATE } from "../src/sharding/params.js";
 
 // Ceiling on a single buffered frame. Above room.js's own MAX_FRAME_BYTES
 // (256 KiB) so room.js still makes the semantic close(1009) decision, but low
@@ -248,15 +250,32 @@ export function createRelay(options = {}) {
   const shardMode = resolveMode(cfg);
   let shardStore = cfg.shardMapStore || null;
   let shardPoller = null;
+  let shardDrain = null;
+  // On a reload, relinquished buckets are scheduled to drain; a re-acquired
+  // bucket cancels any pending drain (§7.4).
+  function applyShardDiff(diff) {
+    if (!shardDrain) return;
+    for (const b of diff.relinquished) shardDrain.relinquish(b);
+    for (const b of diff.acquired) shardDrain.reacquire(b);
+  }
   if (shardMode !== MODE_DIRECT && !shardStore) {
     shardStore = new ShardMapStore({ selfHost: cfg.selfHost });
     shardPoller = new ShardMapPoller({
       url: cfg.shardMapUrl,
       fetchText: cfg.fetchText || defaultFetchText,
       store: shardStore,
-      onAdopt: () => metrics.inc("shard_map_reloads_total"),
+      onAdopt: (_map, diff) => { metrics.inc("shard_map_reloads_total"); applyShardDiff(diff); },
       onError: () => metrics.inc("shard_map_fetch_errors_total"),
       log: (m) => { if (cfg.env && cfg.env.RELAY_LOG === "true") console.log(m); },
+    });
+  }
+  if (shardMode !== MODE_DIRECT) {
+    shardDrain = new DrainScheduler({
+      drainDelayMs: cfg.drainDelayMs ?? RESHARD_DRAIN_DELAY_MS,
+      evictionRatePerSec: cfg.evictionRate ?? RESHARD_EVICTION_RATE,
+      now: cfg.now ?? Date.now,
+      evict: (roomName) => runtime.closeRoom(roomName, WS_RESHARD_CODE, reshardReason()),
+      liveRooms: (bucket) => runtime.roomsInBucket(bucket),
     });
   }
   metrics.inc("shard_reject_total", 0); // pre-register so they always appear
@@ -280,6 +299,17 @@ export function createRelay(options = {}) {
       await bootSleep(cfg.bootRetryMs ?? 1000);
     }
     shardPoller.start(cfg.pollIntervalMs ?? SHARDMAP_POLL_INTERVAL_MS);
+  }
+
+  let drainTimer = null;
+  function startDrainTicker() {
+    if (!shardDrain) return;
+    const si = cfg.setInterval ?? setInterval;
+    drainTimer = si(() => shardDrain.run(), cfg.drainTickMs ?? 1000);
+    if (drainTimer && typeof drainTimer.unref === "function") drainTimer.unref();
+  }
+  function stopDrainTicker() {
+    if (drainTimer !== null) { clearInterval(drainTimer); drainTimer = null; }
   }
 
   const attestOver = cfg.attestLimit ? makeLimiter(cfg.attestLimit) : () => false;
@@ -529,6 +559,7 @@ export function createRelay(options = {}) {
     _sweepKeepalive: sweepKeepalive,
     shardStore,
     shardPoller,
+    shardDrain,
     async listen(port, host) {
       await runtime.rehydrate();
       await bootstrapShardMap();
@@ -541,6 +572,7 @@ export function createRelay(options = {}) {
       });
       startKeepalive();
       startMetricsPushIfConfigured();
+      startDrainTicker();
       return this;
     },
     address() {
@@ -550,6 +582,7 @@ export function createRelay(options = {}) {
       if (keepaliveTimer) clearInterval(keepaliveTimer);
       if (stopMetricsPush) stopMetricsPush();
       if (shardPoller) shardPoller.stop();
+      stopDrainTicker();
       for (const ws of wss.clients) {
         try { ws.close(1001, "server shutting down"); } catch { /* ignore */ }
       }

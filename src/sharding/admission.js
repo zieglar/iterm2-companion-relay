@@ -9,7 +9,7 @@
 // attest failure nor a limiter drain (that ordering is a server-integration
 // concern, marked it.todo in the test).
 
-import { bucketForRoomName } from "./room.js";
+import { bucketForRoomName } from "./bucket.js";
 import { MODE_DIRECT } from "./mode.js";
 
 export const REJECT_STATUS = 421;

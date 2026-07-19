@@ -16,6 +16,8 @@
 // worth keeping in memory, so it is evicted (its persisted state stays in
 // SQLite and is rehydrated on next access).
 
+import { bucketForRoomName } from "../src/sharding/bucket.js";
+
 // setTimeout stores its delay in a signed 32-bit int; a larger delay is clamped
 // to 1 ms (and warns), so long waits must be chunked. ~24.9 days.
 const MAX_DELAY = 2 ** 31 - 1;
@@ -328,6 +330,37 @@ export class Runtime {
       const ctx = await this.get(roomName);
       this.maybeEvict(ctx);
     }
+  }
+
+  // Distributed-mode drain support (§7.4). Both are additive and read-only over
+  // the live room map, so they do not touch the pin/evict/split-brain invariants
+  // above.
+
+  // Live rooms (at least one socket) whose room name hashes into `bucket`.
+  // Scan-based: fine for the periodic, rare drain tick since live rooms are
+  // bounded; a bucket index could replace it if drains ever need to scale.
+  roomsInBucket(bucket) {
+    const out = [];
+    for (const [roomName, ctx] of this.rooms) {
+      if (ctx.getWebSockets().length > 0 && bucketForRoomName(roomName) === bucket) {
+        out.push(roomName);
+      }
+    }
+    return out;
+  }
+
+  // Close every socket of a room together (atomic per-room eviction, §7.4), so
+  // both endpoints re-resolve to the new owner as a unit. Each close is
+  // server-initiated, so webSocketClose does not fire (no closePeerOf cascade);
+  // closing both directly is what makes the room move whole.
+  closeRoom(roomName, code, reason) {
+    const ctx = this.rooms.get(roomName);
+    if (!ctx) return 0;
+    const sockets = ctx.getWebSockets();
+    for (const ws of sockets) {
+      try { ws.close(code, reason); } catch { /* ignore */ }
+    }
+    return sockets.length;
   }
 
   // Cancel every room's alarm timer and drop all rooms, so no timer fires after
