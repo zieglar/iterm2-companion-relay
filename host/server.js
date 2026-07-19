@@ -19,6 +19,9 @@ import { Room } from "../src/room.js";
 import { entryReject, ROOM_HEADER } from "../src/index.js";
 import { resolveMode, MODE_DIRECT } from "../src/sharding/mode.js";
 import { ownershipDecision } from "../src/sharding/admission.js";
+import { ShardMapStore } from "../src/sharding/shardMapStore.js";
+import { ShardMapPoller } from "../src/sharding/shardMapPoller.js";
+import { SHARDMAP_POLL_INTERVAL_MS } from "../src/sharding/params.js";
 
 // Ceiling on a single buffered frame. Above room.js's own MAX_FRAME_BYTES
 // (256 KiB) so room.js still makes the semantic close(1009) decision, but low
@@ -195,6 +198,14 @@ function abortUpgrade(socket, status, message) {
   socket.destroy();
 }
 
+// The distributed-mode shard-map GET. Direct HTTPS to the CDN; the on-box proxy
+// is not in this path. Injected in tests via cfg.fetchText.
+async function defaultFetchText(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`shardmap HTTP ${r.status}`);
+  return await r.text();
+}
+
 export function createRelay(options = {}) {
   const cfg = { ...DEFAULTS, ...options };
   const env = options.env || {};
@@ -230,20 +241,45 @@ export function createRelay(options = {}) {
   // A falsy limit config disables that limiter entirely (mirrors the old
   // deployment where the rate-limit binding was optional): the deployment still
   // serves, unthrottled, rather than failing.
-  // Sharding mode gate (§6.5). Direct mode (self-host) owns every bucket, so this
-  // is a no-op; distributed mode consults the injected shard-map store to reject
-  // buckets this box does not own (reject-on-doubt).
+  // Sharding mode (§6.5). Direct mode (self-host) owns every bucket and never
+  // fetches a map, so the gate is a no-op. Distributed mode consults a shard-map
+  // store kept current by a poller; a store may be injected (tests), otherwise it
+  // is built from config (shardMapUrl + selfHost) with its own poller.
   const shardMode = resolveMode(cfg);
-  const shardStore = cfg.shardMapStore || null;
+  let shardStore = cfg.shardMapStore || null;
+  let shardPoller = null;
   if (shardMode !== MODE_DIRECT && !shardStore) {
-    throw new Error("distributed mode requires a shard-map store (cfg.shardMapStore)");
+    shardStore = new ShardMapStore({ selfHost: cfg.selfHost });
+    shardPoller = new ShardMapPoller({
+      url: cfg.shardMapUrl,
+      fetchText: cfg.fetchText || defaultFetchText,
+      store: shardStore,
+      onAdopt: () => metrics.inc("shard_map_reloads_total"),
+      onError: () => metrics.inc("shard_map_fetch_errors_total"),
+      log: (m) => { if (cfg.env && cfg.env.RELAY_LOG === "true") console.log(m); },
+    });
   }
-  metrics.inc("shard_reject_total", 0); // pre-register so it always appears
+  metrics.inc("shard_reject_total", 0); // pre-register so they always appear
+  metrics.inc("shard_map_reloads_total", 0);
+  metrics.inc("shard_map_fetch_errors_total", 0);
   function ownershipGate(room) {
     if (shardMode === MODE_DIRECT) return { admit: true };
     return ownershipDecision({
       mode: shardMode, roomName: room, ownsBucket: (b) => shardStore.ownsBucket(b),
     });
+  }
+
+  const bootSleep = cfg.bootSleep || ((ms) => new Promise((r) => setTimeout(r, ms)));
+  // Fetch the map before accepting connections (§6.5), retrying until the first
+  // map is adopted: accepting with an empty owned set would 421 every bucket.
+  async function bootstrapShardMap() {
+    if (!shardPoller) return; // direct mode, or an injected store the caller owns
+    while (!shardStore.hasMap) {
+      await shardPoller.fetchOnce();
+      if (shardStore.hasMap) break;
+      await bootSleep(cfg.bootRetryMs ?? 1000);
+    }
+    shardPoller.start(cfg.pollIntervalMs ?? SHARDMAP_POLL_INTERVAL_MS);
   }
 
   const attestOver = cfg.attestLimit ? makeLimiter(cfg.attestLimit) : () => false;
@@ -491,8 +527,11 @@ export function createRelay(options = {}) {
     metrics,
     // Test hook: run one keepalive sweep synchronously (see sweepKeepalive).
     _sweepKeepalive: sweepKeepalive,
+    shardStore,
+    shardPoller,
     async listen(port, host) {
       await runtime.rehydrate();
+      await bootstrapShardMap();
       await new Promise((resolve, reject) => {
         httpServer.once("error", reject);
         httpServer.listen(port, host, () => {
@@ -510,6 +549,7 @@ export function createRelay(options = {}) {
     async close() {
       if (keepaliveTimer) clearInterval(keepaliveTimer);
       if (stopMetricsPush) stopMetricsPush();
+      if (shardPoller) shardPoller.stop();
       for (const ws of wss.clients) {
         try { ws.close(1001, "server shutting down"); } catch { /* ignore */ }
       }
