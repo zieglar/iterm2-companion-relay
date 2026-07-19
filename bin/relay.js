@@ -10,6 +10,19 @@
 
 import { createRelay } from "../host/server.js";
 
+// Prefix every log line with a wall-clock timestamp at microsecond resolution
+// (epoch `seconds.microseconds`), so lines are ordered and effectively unique.
+// performance.timeOrigin is epoch-ms at start; performance.now() adds sub-ms
+// elapsed. Wrapping console here covers every log site in the process (room
+// dlog, server, and this entrypoint) without threading a logger everywhere.
+function logTimestamp() {
+  return ((performance.timeOrigin + performance.now()) / 1000).toFixed(6);
+}
+for (const level of ["log", "warn", "error"]) {
+  const orig = console[level].bind(console);
+  console[level] = (...args) => orig(logTimestamp(), ...args);
+}
+
 const HOST = process.env.RELAY_HOST || "127.0.0.1";
 const PORT = Number(process.env.RELAY_PORT || process.env.PORT || 8787);
 const DB_PATH = process.env.RELAY_DB || "relay.db";

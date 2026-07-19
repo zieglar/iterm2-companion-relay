@@ -19,6 +19,7 @@ import { Room } from "../src/room.js";
 import { entryReject, ROOM_HEADER } from "../src/index.js";
 import { resolveMode, MODE_DIRECT } from "../src/sharding/mode.js";
 import { ownershipDecision } from "../src/sharding/admission.js";
+import { bucketForRoomName } from "../src/sharding/bucket.js";
 import { ShardMapStore } from "../src/sharding/shardMapStore.js";
 import { ShardMapPoller } from "../src/sharding/shardMapPoller.js";
 import { DrainScheduler } from "../src/sharding/drainScheduler.js";
@@ -255,6 +256,9 @@ export function createRelay(options = {}) {
     // signed join for this box's buckets would fail.
     assertOriginMatches((cfg.env && cfg.env.RELAY_ORIGIN) || "", cfg.selfHost);
   }
+  // Diagnostic log for sharding events (map adopt, drain evictions, fetch
+  // failures), gated on RELAY_LOG like the room logs.
+  const shardLog = (m) => { if (cfg.env && cfg.env.RELAY_LOG === "true") console.log(m); };
   let shardStore = cfg.shardMapStore || null;
   let shardPoller = null;
   let shardDrain = null;
@@ -271,9 +275,14 @@ export function createRelay(options = {}) {
       url: cfg.shardMapUrl,
       fetchText: cfg.fetchText || defaultFetchText,
       store: shardStore,
-      onAdopt: (_map, diff) => { metrics.inc("shard_map_reloads_total"); applyShardDiff(diff); },
+      onAdopt: (map, diff) => {
+        metrics.inc("shard_map_reloads_total");
+        shardLog(`shardmap v${map.version} adopted: now own ${shardStore.ownedCount} buckets ` +
+          `(+${diff.acquired.size} acquired, -${diff.relinquished.size} relinquished)`);
+        applyShardDiff(diff);
+      },
       onError: () => metrics.inc("shard_map_fetch_errors_total"),
-      log: (m) => { if (cfg.env && cfg.env.RELAY_LOG === "true") console.log(m); },
+      log: shardLog,
     });
   }
   if (shardMode !== MODE_DIRECT) {
@@ -292,7 +301,11 @@ export function createRelay(options = {}) {
       drainDelayMs: drainMs,
       evictionRatePerSec: rate,
       now: cfg.now ?? Date.now,
-      evict: (roomName) => runtime.closeRoom(roomName, WS_RESHARD_CODE, reshardReason()),
+      evict: (roomName) => {
+        const n = runtime.closeRoom(roomName, WS_RESHARD_CODE, reshardReason());
+        if (n > 0) shardLog(`shardmap drain: evicted room in bucket ${bucketForRoomName(roomName)} ` +
+          `(WS 4421, ${n} sockets -> re-resolve)`);
+      },
       liveRooms: (bucket) => runtime.roomsInBucket(bucket),
     });
   }
