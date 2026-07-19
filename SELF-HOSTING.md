@@ -27,6 +27,15 @@ traffic. Pick **Path B** if you want your origin IP hidden and free DDoS
 absorption. You can start with A and add Cloudflare later without touching the
 relay itself.
 
+> **Direct vs distributed mode.** This guide stands up a **single relay**
+> (direct mode) — the default with no extra config, and what almost every
+> self-hoster wants. The relay also has a **distributed (sharded) mode** for
+> running several of your own boxes behind a static shard map, so load spreads
+> across hosts and you can add or drain them without breaking pairings. That is a
+> fleet feature: enable it by setting `RELAY_SHARDMAP_URL` + `RELAY_SELF_HOST`
+> (see `ops/relay.env.example`) and read the design in the relay sharding design
+> doc. Everything else in this guide applies to a single box in either mode.
+
 > **What about deploying to Cloudflare Workers?** This relay originally ran as a
 > Cloudflare Worker + Durable Object, and that code still lives in the git
 > history. It was retired because Durable Objects bill **per connection**, and a

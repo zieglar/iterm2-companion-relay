@@ -31,6 +31,18 @@ const overrides = {
 };
 for (const k of Object.keys(overrides)) if (overrides[k] === undefined) delete overrides[k];
 
+// Sharding (distributed mode). Set BOTH to join a sharded fleet: the map URL the
+// box polls, and this box's own hostname (its map identity and the base of its
+// proof origin, which must equal https://<selfHost> == RELAY_ORIGIN). Set
+// neither to run direct mode (the self-hosted default). Setting exactly one is a
+// misconfiguration and createRelay throws below. Optional tunables override the
+// Appendix C defaults.
+if (process.env.RELAY_SHARDMAP_URL) overrides.shardMapUrl = process.env.RELAY_SHARDMAP_URL;
+if (process.env.RELAY_SELF_HOST) overrides.selfHost = process.env.RELAY_SELF_HOST;
+const pollMs = numEnv("RELAY_SHARDMAP_POLL_MS"); if (pollMs) overrides.pollIntervalMs = pollMs;
+const drainMs = numEnv("RELAY_DRAIN_DELAY_MS"); if (drainMs) overrides.drainDelayMs = drainMs;
+const evictionRate = numEnv("RELAY_EVICTION_RATE"); if (evictionRate) overrides.evictionRate = evictionRate;
+
 // Off-box monitoring by outbound push (host/metricspush.js). Both a collector
 // URL and a shared token are required to enable it; missing either leaves the
 // relay with no metrics egress and /metrics loopback-only.
@@ -62,7 +74,15 @@ if (!overrides.trustProxy && !overrides.trustCloudflare &&
     "proxy, or RELAY_TRUST_CLOUDFLARE=true behind Cloudflare.");
 }
 
-const relay = createRelay({ env: process.env, dbPath: DB_PATH, ...overrides });
+let relay;
+try {
+  relay = createRelay({ env: process.env, dbPath: DB_PATH, ...overrides });
+} catch (err) {
+  // A bad sharding config (only one of URL/selfHost, origin mismatch, drain
+  // delay too short) throws here; surface it cleanly rather than as a stack.
+  console.error("relay: invalid configuration:", err.message);
+  process.exit(1);
+}
 
 // Last-resort net: the runtime guards each per-socket handler (the known
 // failure source), but anything stray must still not drop every room. Log and
@@ -127,9 +147,10 @@ process.on("SIGUSR2", () => {
 
 relay.listen(PORT, HOST).then(() => {
   const { port } = relay.address();
+  const mode = relay.shardStore ? `distributed(selfHost=${process.env.RELAY_SELF_HOST})` : "direct";
   // Non-identifying startup line only (no rooms, no IPs): honors the zero-PII
   // posture while still confirming the process is up.
-  console.log(`relay: listening on ${HOST}:${port} (db=${DB_PATH}, attest=${process.env.ATTEST_REQUIRED ?? "required"})`);
+  console.log(`relay: listening on ${HOST}:${port} (db=${DB_PATH}, mode=${mode}, attest=${process.env.ATTEST_REQUIRED ?? "required"})`);
 }).catch((err) => {
   console.error("relay: failed to start:", err.message);
   process.exit(1);

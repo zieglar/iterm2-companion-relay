@@ -31,7 +31,7 @@ async function boot(fetchText, extra = {}) {
   });
   await relay.listen(0, "127.0.0.1");
   const port = relay.address().port;
-  return { relay, wsBase: `ws://127.0.0.1:${port}` };
+  return { relay, base: `http://127.0.0.1:${port}`, wsBase: `ws://127.0.0.1:${port}` };
 }
 
 function wsAttempt(wsBase, room) {
@@ -57,6 +57,18 @@ describe("distributed boot", () => {
     }
   });
 
+  it("renders the shard gauges on /metrics", async () => {
+    const { relay, base } = await boot(async () => MAP_JSON);
+    try {
+      const text = await (await fetch(base + "/metrics")).text();
+      expect(text).toContain("relay_shard_map_version 7");
+      expect(text).toContain("relay_shard_owned_buckets 15536"); // [50000, 65535]
+      expect(text).toContain("relay_shard_draining_buckets 0");
+    } finally {
+      await relay.close();
+    }
+  });
+
   it("retries the boot fetch until the first map is adopted", async () => {
     let calls = 0;
     const fetchText = async () => {
@@ -72,5 +84,37 @@ describe("distributed boot", () => {
     } finally {
       await relay.close();
     }
+  });
+});
+
+describe("distributed config validation (createRelay fails fast)", () => {
+  const env = { RELAY_ORIGIN: "https://relay1", RELAY_LOG: "false" };
+  const store = { ownsBucket: () => true };
+
+  it("throws when only one of shardMapUrl / selfHost is set", () => {
+    expect(() => createRelay({ env, dbPath: ":memory:", shardMapUrl: "https://cdn/shardmap.json" })).toThrow();
+    expect(() => createRelay({ env, dbPath: ":memory:", selfHost: "relay1" })).toThrow();
+  });
+
+  it("throws when RELAY_ORIGIN does not equal https:// + selfHost", () => {
+    expect(() => createRelay({
+      env: { RELAY_ORIGIN: "https://wrong-host" }, dbPath: ":memory:",
+      shardMapUrl: "https://cdn/shardmap.json", selfHost: "relay1", shardMapStore: store,
+    })).toThrow();
+  });
+
+  it("throws when the drain delay is under 2x the poll interval", () => {
+    expect(() => createRelay({
+      env, dbPath: ":memory:",
+      shardMapUrl: "https://cdn/shardmap.json", selfHost: "relay1", shardMapStore: store,
+      pollIntervalMs: 10_000, drainDelayMs: 15_000,
+    })).toThrow();
+  });
+
+  it("does not throw for a valid distributed config", () => {
+    expect(() => createRelay({
+      env, dbPath: ":memory:",
+      shardMapUrl: "https://cdn/shardmap.json", selfHost: "relay1", shardMapStore: store,
+    })).not.toThrow();
   });
 });

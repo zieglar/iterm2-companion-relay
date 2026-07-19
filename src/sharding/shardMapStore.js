@@ -30,6 +30,11 @@ export class ShardMapStore {
     return this._map !== null;
   }
 
+  // Number of buckets currently owned (cheap; for metrics, avoids copying).
+  get ownedCount() {
+    return this._owned.size;
+  }
+
   // applyFetched(validatedMap) -> { adopted, acquired, relinquished }
   applyFetched(validatedMap) {
     if (this._map && validatedMap.version <= this._map.version) {

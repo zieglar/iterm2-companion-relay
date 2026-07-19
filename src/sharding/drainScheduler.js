@@ -63,4 +63,9 @@ export class DrainScheduler {
   get drainingBuckets() {
     return new Set(this._draining.keys());
   }
+
+  // Number of buckets currently draining (cheap; for metrics).
+  get drainingCount() {
+    return this._draining.size;
+  }
 }

@@ -23,6 +23,9 @@ const COUNTER_HELP = {
   quota_exceeded_total: "Sockets closed because their room exceeded its daily byte quota.",
   phone_no_mac_total: "Phones turned away because no mac was parked in their room (admit -> \"mac offline\").",
   ws_keepalive_terminated_total: "Sockets terminated by keepalive after a missed ping/pong (dead peer or path).",
+  shard_reject_total: "Requests rejected because this box does not own the bucket (reject-on-doubt).",
+  shard_map_reloads_total: "Shard-map versions adopted (distributed mode).",
+  shard_map_fetch_errors_total: "Shard-map fetches that failed (kept last-known-good).",
 };
 const GAUGE_HELP = {
   rooms_live: "Rooms currently resident in memory.",
@@ -31,6 +34,9 @@ const GAUGE_HELP = {
   rooms_mac_only: "Resident rooms with a mac parked but no phone.",
   rooms_phone_only: "Resident rooms with a phone admitted but no mac (should stay 0; invariant tripwire).",
   rooms_neither: "Resident rooms with no admitted socket (pre-auth only, or idle established).",
+  shard_map_version: "Adopted shard-map version, or -1 if none (distributed mode).",
+  shard_owned_buckets: "Buckets this box currently owns (distributed mode).",
+  shard_draining_buckets: "Buckets currently draining after a reshard (distributed mode).",
 };
 
 export class Metrics {

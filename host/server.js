@@ -277,9 +277,18 @@ export function createRelay(options = {}) {
     });
   }
   if (shardMode !== MODE_DIRECT) {
+    const pollMs = cfg.pollIntervalMs ?? SHARDMAP_POLL_INTERVAL_MS;
+    const drainMs = cfg.drainDelayMs ?? RESHARD_DRAIN_DELAY_MS;
+    const rate = cfg.evictionRate ?? RESHARD_EVICTION_RATE;
+    // §7.4: the drain must defer at least two poll intervals; fail fast on a bad
+    // operator override rather than risk bouncing clients between hosts.
+    if (drainMs < 2 * pollMs) {
+      throw new Error(`drainDelayMs (${drainMs}) must be >= 2x pollIntervalMs (${pollMs})`);
+    }
+    if (rate <= 0) throw new Error(`evictionRate (${rate}) must be positive`);
     shardDrain = new DrainScheduler({
-      drainDelayMs: cfg.drainDelayMs ?? RESHARD_DRAIN_DELAY_MS,
-      evictionRatePerSec: cfg.evictionRate ?? RESHARD_EVICTION_RATE,
+      drainDelayMs: drainMs,
+      evictionRatePerSec: rate,
       now: cfg.now ?? Date.now,
       evict: (roomName) => runtime.closeRoom(roomName, WS_RESHARD_CODE, reshardReason()),
       liveRooms: (bucket) => runtime.roomsInBucket(bucket),
@@ -293,6 +302,16 @@ export function createRelay(options = {}) {
     return ownershipDecision({
       mode: shardMode, roomName: room, ownsBucket: (b) => shardStore.ownsBucket(b),
     });
+  }
+  // Point-in-time shard gauges for /metrics. Empty in direct mode, so a
+  // self-hosted box's metrics are unchanged.
+  function shardGauges() {
+    if (shardMode === MODE_DIRECT) return {};
+    return {
+      shard_map_version: shardStore.version,
+      shard_owned_buckets: shardStore.ownedCount,
+      shard_draining_buckets: shardDrain ? shardDrain.drainingCount : 0,
+    };
   }
 
   const bootSleep = cfg.bootSleep || ((ms) => new Promise((r) => setTimeout(r, ms)));
@@ -356,6 +375,7 @@ export function createRelay(options = {}) {
           rooms_mac_only: occ.mac_only,
           rooms_phone_only: occ.phone_only,
           rooms_neither: occ.neither,
+          ...shardGauges(),
         }));
       }
 
