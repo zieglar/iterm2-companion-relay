@@ -1,0 +1,6 @@
+{
+  "version": 1,
+  "ranges": [
+    { "low": 0, "high": 65535, "host": "relay1.iterm2.com" }
+  ]
+}

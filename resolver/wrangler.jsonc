@@ -1,0 +1,24 @@
+{
+  // iTerm2 shard-map resolver: a Cloudflare Worker that serves the resolved-mode
+  // shard map (src/shardmap.json, embedded in the Worker bundle) at the edge.
+  // No R2, no KV, no build step. See README.md and src/worker.js.
+  "name": "iterm2-resolver",
+  "main": "src/worker.js",
+  "compatibility_date": "2026-07-01",
+
+  // Route the WHOLE subdomain to this Worker (not just /shardmap.json) so a
+  // request can never fall through to the origin: the Worker answers every path
+  // (200 for /shardmap.json, 404 otherwise). Worker routes only run on PROXIED
+  // (orange-cloud) traffic, so resolver.iterm2.com needs a proxied DNS record
+  // (see README "DNS"). zone_name lets wrangler resolve the zone id.
+  "routes": [
+    { "pattern": "resolver.iterm2.com/*", "zone_name": "iterm2.com" }
+  ],
+
+  // No *.workers.dev endpoint: reachable ONLY via the route above.
+  "workers_dev": false
+
+  // Deliberately NO kv_namespaces / r2_buckets / durable_objects / queues and NO
+  // observability: none of those exist here, so nothing in this Worker can bill.
+  // On the free plan, requests over the daily limit are throttled, never charged.
+}
