@@ -33,7 +33,10 @@ ENV_FILE="${POS[1]:-ops/deploy.env}"
 SSH_USER="${SSH_USER:-root}"
 SSH_PORT="${SSH_PORT:-22}"
 TARGET="${SSH_USER}@${HOST}"
-REMOTE_DIR="/root/.iterm2-relay-deploy"
+# Relative to the remote user's home, so SSH_USER=<sudo-user> works as well as
+# root (deploy-vps.sh already elevates itself with sudo). For root this is
+# /root/.iterm2-relay-deploy, same location as before.
+REMOTE_DIR=".iterm2-relay-deploy"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 

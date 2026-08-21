@@ -31,6 +31,12 @@ DASHBOARD_USER="${DASHBOARD_USER:-admin}"
 DASHBOARD_PASSWORD="${DASHBOARD_PASSWORD:-}"
 RELAY_METRICS_PUSH_URL="${RELAY_METRICS_PUSH_URL:-}"
 RELAY_METRICS_PUSH_TOKEN="${RELAY_METRICS_PUSH_TOKEN:-}"
+# Sharding (distributed mode). Blank RELAY_SHARDMAP_URL = direct mode (default).
+RELAY_SHARDMAP_URL="${RELAY_SHARDMAP_URL:-}"
+RELAY_SELF_HOST="${RELAY_SELF_HOST:-}"
+RELAY_SHARDMAP_POLL_MS="${RELAY_SHARDMAP_POLL_MS:-}"
+RELAY_DRAIN_DELAY_MS="${RELAY_DRAIN_DELAY_MS:-}"
+RELAY_EVICTION_RATE="${RELAY_EVICTION_RATE:-}"
 REPO_URL="${REPO_URL:-https://github.com/gnachman/iterm2-companion-relay}"
 REPO_REF="${REPO_REF:-main}"
 SRC_DIR="${SRC_DIR:-}"
@@ -45,6 +51,35 @@ DASHBOARD_SERVICE_USER="${DASHBOARD_SERVICE_USER:-}"
 
 RELAY_ORIGIN="https://${RELAY_ORIGIN_HOST}"
 is_true() { case "${1,,}" in true|yes|1|on) return 0;; *) return 1;; esac; }
+
+# ── Sharding config validation (fail fast HERE, not as a crash-looping unit) ──
+# The relay refuses to boot on any of these misconfigurations; catching them at
+# deploy time turns a systemd crash loop into an immediate, explained error.
+if [ -n "$RELAY_SHARDMAP_URL" ]; then
+  # The box's map identity must byte-equal its origin host (TLS cert name, map
+  # `host` field, and proof-origin base are all the same string; design §6.10).
+  # The deploy already knows that string, so default RELAY_SELF_HOST to it and
+  # reject a divergent override: with a wrong selfHost the box either refuses to
+  # boot (origin mismatch) or, worse, boots owning zero buckets and 421s all
+  # traffic.
+  RELAY_SELF_HOST="${RELAY_SELF_HOST:-$RELAY_ORIGIN_HOST}"
+  if [ "$RELAY_SELF_HOST" != "$RELAY_ORIGIN_HOST" ]; then
+    echo "RELAY_SELF_HOST (${RELAY_SELF_HOST}) must equal RELAY_ORIGIN_HOST (${RELAY_ORIGIN_HOST});" >&2
+    echo "leave RELAY_SELF_HOST blank to derive it." >&2
+    exit 1
+  fi
+  # §7.4: the drain defer must cover two poll intervals.
+  poll_ms="${RELAY_SHARDMAP_POLL_MS:-10000}"
+  drain_ms="${RELAY_DRAIN_DELAY_MS:-20000}"
+  if [ "$drain_ms" -lt $((2 * poll_ms)) ]; then
+    echo "RELAY_DRAIN_DELAY_MS (${drain_ms}) must be >= 2x RELAY_SHARDMAP_POLL_MS (${poll_ms})." >&2
+    exit 1
+  fi
+elif [ -n "$RELAY_SELF_HOST" ]; then
+  echo "RELAY_SELF_HOST is set but RELAY_SHARDMAP_URL is not: set both (distributed mode)" >&2
+  echo "or neither (direct mode). The relay refuses to boot with exactly one." >&2
+  exit 1
+fi
 
 # Ensure a locked-down system account exists (no login, no home).
 ensure_user() {
@@ -63,7 +98,11 @@ render_unit() {  # <unit-file> <service-user-or-empty>
   fi
 }
 
-echo "==> Deploying relay for ${RELAY_ORIGIN} into ${APP_DIR}"
+if [ -n "$RELAY_SHARDMAP_URL" ]; then
+  echo "==> Deploying relay for ${RELAY_ORIGIN} into ${APP_DIR} (distributed mode, map: ${RELAY_SHARDMAP_URL})"
+else
+  echo "==> Deploying relay for ${RELAY_ORIGIN} into ${APP_DIR} (direct mode)"
+fi
 if [ "$(id -u)" -eq 0 ]; then
   # Already root (e.g. `ssh root@host` / ops/deploy-remote.sh): shim `sudo` to a
   # passthrough that drops its own flags, so every sudo-based step below runs
@@ -134,6 +173,14 @@ if [ -n "$RELAY_METRICS_PUSH_URL" ] && [ -n "$RELAY_METRICS_PUSH_TOKEN" ]; then
   relay_env+="
 RELAY_METRICS_PUSH_URL=${RELAY_METRICS_PUSH_URL}
 RELAY_METRICS_PUSH_TOKEN=${RELAY_METRICS_PUSH_TOKEN}"
+fi
+if [ -n "$RELAY_SHARDMAP_URL" ]; then
+  relay_env+="
+RELAY_SHARDMAP_URL=${RELAY_SHARDMAP_URL}
+RELAY_SELF_HOST=${RELAY_SELF_HOST}"
+  if [ -n "$RELAY_SHARDMAP_POLL_MS" ]; then relay_env+=$'\n'"RELAY_SHARDMAP_POLL_MS=${RELAY_SHARDMAP_POLL_MS}"; fi
+  if [ -n "$RELAY_DRAIN_DELAY_MS" ]; then relay_env+=$'\n'"RELAY_DRAIN_DELAY_MS=${RELAY_DRAIN_DELAY_MS}"; fi
+  if [ -n "$RELAY_EVICTION_RATE" ]; then relay_env+=$'\n'"RELAY_EVICTION_RATE=${RELAY_EVICTION_RATE}"; fi
 fi
 printf '%s\n' "$relay_env" | sudo tee /etc/iterm2-companion-relay.env >/dev/null
 sudo chmod 600 /etc/iterm2-companion-relay.env
@@ -231,6 +278,11 @@ echo
 echo "────────────────────────────────────────────────────────────────────"
 echo "Deploy complete: ${RELAY_ORIGIN}"
 echo "  relay:     sudo systemctl status iterm2-companion-relay"
+if [ -n "$RELAY_SHARDMAP_URL" ]; then
+  echo "  sharding:  distributed mode (map: ${RELAY_SHARDMAP_URL})"
+  echo "             this host serves only buckets the map assigns to ${RELAY_SELF_HOST};"
+  echo "             check: curl -s localhost:8787/metrics | grep shard_"
+fi
 if is_true "$ENABLE_DASHBOARD"; then
   echo "  dashboard: https://${RELAY_ORIGIN_HOST}/dashboard/"
   echo "             login: ${DASHBOARD_USER} / ${DASHBOARD_PASSWORD}"
