@@ -22,7 +22,17 @@ const PATH = "/shardmap.json";
 const BODY = JSON.stringify(shardmap) + "\n";
 const BODY_BYTES = new TextEncoder().encode(BODY);
 
-const CACHE_CONTROL = "public, max-age=300, stale-while-revalidate=86400";
+// max-age=5 is load-bearing, not a tuning knob (design §6.3, Appendix C:
+// "Cache-Control: max-age=5"). Clients fetch the map with an ordinary
+// protocol-caching HTTP client, and the §6.4 re-resolve path ("force a map
+// refresh" after HTTP 421 / WS 4421) relies on that cache expiring almost
+// immediately: with a long max-age an evicted client would re-read its stale
+// cached map, bounce back to the old owner, and 421-ping-pong until the cache
+// expired. No stale-while-revalidate for the same reason: serving a stale map
+// while revalidating is exactly the wrong behavior during a reshard. Relays
+// are unaffected either way (their fetcher does not use an HTTP cache); this
+// header exists for the client re-resolve path.
+const CACHE_CONTROL = "public, max-age=5";
 
 // Strong ETag = quoted SHA-256 of the body (no W/ prefix). Computed lazily once
 // and memoized, so there is no per-request hashing and no top-level await.

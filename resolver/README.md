@@ -9,7 +9,7 @@ dependency, so it stays up even if the web server is down.
 
 - **Live in seconds.** A Worker deploy propagates globally in seconds, and
   Cloudflare does not edge-cache a Worker's own response, so a redeploy is served
-  immediately at the edge. (`Cache-Control: max-age=300` is the hint to
+  immediately at the edge. (`Cache-Control: max-age=5` is the hint to
   *downstream* HTTP caches; the relays' fetcher does not use an HTTP cache, so
   they get fresh content on their next poll. See "Caching" below.)
 - **No origin fallthrough.** The whole `resolver.iterm2.com/*` subdomain routes
@@ -74,18 +74,22 @@ curl -i https://resolver.iterm2.com/shardmap.json
 Clients set the pairing QR's `resolver=` to `https://resolver.iterm2.com/`, and
 the relays set `RELAY_SHARDMAP_URL=https://resolver.iterm2.com/shardmap.json`.
 
-## Caching (why `max-age=300` does not fight "live in seconds")
+## Caching (`max-age=5` is a design invariant, not a tuning knob)
 
 - **The edge does not cache the Worker's response** — the Worker runs on every
   request and returns the currently-deployed document. So a redeploy is live at
   the edge in seconds.
-- `Cache-Control: public, max-age=300, stale-while-revalidate=86400` tells
-  *downstream* caches (browsers) they may reuse a copy for up to 5 minutes and
-  serve stale for up to a day while revalidating. It does not delay a deploy.
+- `Cache-Control: public, max-age=5` is the value the design mandates (§6.3,
+  Appendix C), and it is load-bearing for the **client** re-resolve path. On a
+  reshard the losing relay evicts a room with WS 4421 (or rejects with HTTP 421)
+  and the client "forces a map refresh", but the client fetches the map with an
+  ordinary protocol-caching HTTP client, so that refresh only sees the new map
+  once the cached copy has expired. A long `max-age` (or any
+  `stale-while-revalidate`) would hand the evicted client its stale map, bounce
+  it back to the old owner, and 421-ping-pong it until the cache expired. Five
+  seconds bounds that window; the `ETag` makes each revalidation a cheap `304`.
 - The **relays** fetch with a plain HTTP client (no cache), so they always see
-  the deployed content on their next poll. A client that respects `max-age`
-  trades a little freshness for fewer requests; the `ETag` makes revalidation a
-  cheap `304`.
+  the deployed content on their next poll regardless of this header.
 
 ## Files
 
