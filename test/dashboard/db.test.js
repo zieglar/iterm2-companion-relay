@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { DashboardDB } from "../../dashboard/db.js";
 
 function mk() { return new DashboardDB(":memory:"); }
-const snap = (o = {}) => ({ ws_upgrades: 0, ws_rejected: 0, http_requests: 0, http_errors: 0, exceptions: 0, push_errors: 0, quota_exceeded: 0, rooms_live: 0, sockets_live: 0, life_le1: 0, life_le5: 0, life_le15: 0, life_le60: 0, life_le300: 0, life_le1800: 0, life_count: 0, life_sum: 0, ...o });
+const snap = (o = {}) => ({ ws_upgrades: 0, ws_rejected: 0, http_requests: 0, http_errors: 0, exceptions: 0, push_errors: 0, quota_exceeded: 0, rooms_live: 0, sockets_live: 0, life_le1: 0, life_le5: 0, life_le15: 0, life_le60: 0, life_le300: 0, life_le1800: 0, life_count: 0, life_sum: 0, shard_reject: 0, shard_map_reloads: 0, shard_map_fetch_errors: 0, shard_map_version: -1, shard_owned_buckets: 0, shard_draining_buckets: 0, ...o });
 
 describe("DashboardDB", () => {
   it("round-trips a sample and returns the latest", () => {
@@ -49,6 +49,22 @@ describe("DashboardDB", () => {
     const db = mk();
     db.insert(1000, snap({ quota_exceeded: 12 }));
     expect(db.latest().quota_exceeded).toBe(12);
+    db.close();
+  });
+
+  it("round-trips the shard columns (appended after the initial schema)", () => {
+    const db = mk();
+    db.insert(1000, snap({
+      shard_reject: 6, shard_map_reloads: 2, shard_map_fetch_errors: 1,
+      shard_map_version: 9, shard_owned_buckets: 32768, shard_draining_buckets: 4,
+    }));
+    const latest = db.latest();
+    expect(latest.shard_reject).toBe(6);
+    expect(latest.shard_map_reloads).toBe(2);
+    expect(latest.shard_map_fetch_errors).toBe(1);
+    expect(latest.shard_map_version).toBe(9);
+    expect(latest.shard_owned_buckets).toBe(32768);
+    expect(latest.shard_draining_buckets).toBe(4);
     db.close();
   });
 

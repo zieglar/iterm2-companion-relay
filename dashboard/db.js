@@ -24,6 +24,12 @@ const COLUMNS = [
   // Appended after the initial schema shipped; see ensureColumns() for the
   // in-place migration that adds it to a DB created before this column existed.
   "quota_exceeded",
+  // Distributed-mode shard signals, appended likewise (ensureColumns migrates).
+  // Old rows backfill to the SQL default 0, including shard_map_version; the
+  // parse-time -1 sentinel only ever arrives on rows written by a collector
+  // that already knew the column.
+  "shard_reject", "shard_map_reloads", "shard_map_fetch_errors",
+  "shard_map_version", "shard_owned_buckets", "shard_draining_buckets",
 ];
 
 // Push relay columns, in insertion order (mirrors parse.js's PUSH_FIELDS).

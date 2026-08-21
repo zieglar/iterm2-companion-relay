@@ -90,6 +90,25 @@ export function exceptionAlert({ count, threshold }) {
   };
 }
 
+// Shard map-fetch failures (distributed mode only; the counter is always 0 in
+// direct mode). A host that cannot refresh the map serves last-known-good
+// ownership indefinitely BY DESIGN (never fail-open/closed), so this condition
+// does not self-heal into safety: across a reshard a partitioned host keeps
+// serving buckets it no longer owns. The design's mitigation is operational
+// (hard-stop a host that cannot reach the map), which makes this counter the
+// operator's only cue, so it must page.
+export function shardFetchErrorAlert({ count, threshold }) {
+  if (!count || count < threshold) return null;
+  return {
+    key: "shard_fetch",
+    severity: count >= threshold * 5 ? "critical" : "warn",
+    title: `Shard-map fetch errors: ${count}`,
+    body: `${count} shard-map fetch failure(s) since the last check (threshold ${threshold}). ` +
+      `The relay keeps serving its last-known-good map; if this persists across a reshard, ` +
+      `hard-stop the host to complete the drain.`,
+  };
+}
+
 // Liveness: the collector has no fresh snapshot. This is the dead-man's-switch —
 // a wedged or down relay stops pushing, so silence itself is the signal.
 export function livenessAlert(detail) {
@@ -175,6 +194,7 @@ export function normalizeSnapshot(s = {}) {
       requests: s.http_requests_total || 0,
       errors: s.http_errors_total || 0,
       exceptions: s.process_exceptions_total || 0,
+      shardMapFetchErrors: s.shard_map_fetch_errors_total || 0,
     },
     gauges: {
       socketsLive: s.sockets_live || 0,
@@ -188,15 +208,21 @@ export function normalizeSnapshot(s = {}) {
 // to ~0), so the interval is unmeasurable: flag `reset` and skip rate checks
 // rather than emit a bogus negative or huge delta.
 export function deltas(prev, cur) {
-  if (!prev) return { reset: true, requests: 0, errors: 0, exceptions: 0 };
-  if (cur.requests < prev.requests || cur.errors < prev.errors || cur.exceptions < prev.exceptions) {
-    return { reset: true, requests: 0, errors: 0, exceptions: 0 };
+  // `|| 0` throughout: KV state written by an older monitor build predates the
+  // shard counter, and a missing field must read as 0, not NaN-poison the
+  // deltas or fake a reset.
+  const reset = { reset: true, requests: 0, errors: 0, exceptions: 0, shardMapFetchErrors: 0 };
+  if (!prev) return reset;
+  if (cur.requests < prev.requests || cur.errors < prev.errors || cur.exceptions < prev.exceptions ||
+      (cur.shardMapFetchErrors || 0) < (prev.shardMapFetchErrors || 0)) {
+    return reset;
   }
   return {
     reset: false,
     requests: cur.requests - prev.requests,
     errors: cur.errors - prev.errors,
     exceptions: cur.exceptions - prev.exceptions,
+    shardMapFetchErrors: (cur.shardMapFetchErrors || 0) - (prev.shardMapFetchErrors || 0),
   };
 }
 
@@ -245,6 +271,7 @@ export function parseConfig(env = {}) {
     errorRatio: n(env.ERROR_RATIO, 0.05),
     errorMinRequests: n(env.ERROR_MIN_REQUESTS, 100),
     exceptionThreshold: n(env.EXCEPTION_THRESHOLD, 1),
+    shardFetchThreshold: n(env.SHARD_FETCH_THRESHOLD, 1),
     spikeFactor: n(env.SPIKE_FACTOR, 3),
     dropFactor: n(env.DROP_FACTOR, 0.3),
     minBaseline: n(env.MIN_BASELINE, 50),
@@ -282,6 +309,12 @@ export function analyze({ gauges, interval, lastHour }, state, config) {
     if (e) alerts.push(e);
     const x = exceptionAlert({ count: interval.exceptions, threshold: config.exceptionThreshold });
     if (x) alerts.push(x);
+    // `?? 1` so a config parsed by an older build (no shardFetchThreshold)
+    // still alerts rather than silently disabling the check.
+    const sf = shardFetchErrorAlert({
+      count: interval.shardMapFetchErrors, threshold: config.shardFetchThreshold ?? 1,
+    });
+    if (sf) alerts.push(sf);
   }
 
   let newHistory = history;

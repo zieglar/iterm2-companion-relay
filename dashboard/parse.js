@@ -20,6 +20,14 @@ const PLAIN = {
   relay_sockets_live: "sockets_live",
   relay_socket_lifetime_seconds_sum: "life_sum",
   relay_socket_lifetime_seconds_count: "life_count",
+  // Distributed-mode shard signals. A direct-mode relay renders none of these,
+  // so they fall back to the defaults below (version -1 = no map, counts 0).
+  relay_shard_reject_total: "shard_reject",
+  relay_shard_map_reloads_total: "shard_map_reloads",
+  relay_shard_map_fetch_errors_total: "shard_map_fetch_errors",
+  relay_shard_map_version: "shard_map_version",
+  relay_shard_owned_buckets: "shard_owned_buckets",
+  relay_shard_draining_buckets: "shard_draining_buckets",
 };
 
 // Histogram bucket bounds we persist, matching the relay's LIFETIME_BUCKETS. The
@@ -67,6 +75,12 @@ export function parseMetrics(text) {
     sockets_live: 0,
     life_sum: 0,
     life_count: 0,
+    shard_reject: 0,
+    shard_map_reloads: 0,
+    shard_map_fetch_errors: 0,
+    shard_map_version: -1, // "no map adopted" sentinel, matching the relay gauge
+    shard_owned_buckets: 0,
+    shard_draining_buckets: 0,
   };
   for (const b of LIFE_BUCKETS) out[`life_le${b}`] = 0;
 

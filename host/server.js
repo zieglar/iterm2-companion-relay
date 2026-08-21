@@ -603,7 +603,12 @@ export function createRelay(options = {}) {
       url: cfg.metricsPushUrl,
       token: cfg.metricsPushToken,
       intervalMs: cfg.metricsPushMs,
-      buildSnapshot: () => metrics.snapshot({ rooms_live: runtime.size, sockets_live: totalSockets }),
+      // shardGauges() is {} in direct mode, so snapshot() falls back to its
+      // 0 / -1 defaults there; in distributed mode the push carries live
+      // ownership, adoption, and drain state off-box.
+      buildSnapshot: () => metrics.snapshot({
+        rooms_live: runtime.size, sockets_live: totalSockets, ...shardGauges(),
+      }),
       onError: () => metrics.inc("metrics_push_errors_total"),
     });
   }

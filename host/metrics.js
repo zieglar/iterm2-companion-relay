@@ -83,6 +83,17 @@ export class Metrics {
       quota_exceeded_total: c("quota_exceeded_total"),
       rooms_live: gauges.rooms_live || 0,
       sockets_live: gauges.sockets_live || 0,
+      // Shard signals ride the push too: in the loopback-/metrics posture this
+      // payload is the only off-box surface, and a distributed fleet cannot be
+      // operated blind to reshard adoption, drain progress, ownership, and map
+      // -fetch failures. In direct mode the counters are 0 and the gauges are
+      // absent, so this pushes 0s and the -1 "no map" version sentinel.
+      shard_reject_total: c("shard_reject_total"),
+      shard_map_reloads_total: c("shard_map_reloads_total"),
+      shard_map_fetch_errors_total: c("shard_map_fetch_errors_total"),
+      shard_map_version: gauges.shard_map_version ?? -1,
+      shard_owned_buckets: gauges.shard_owned_buckets || 0,
+      shard_draining_buckets: gauges.shard_draining_buckets || 0,
     };
   }
 

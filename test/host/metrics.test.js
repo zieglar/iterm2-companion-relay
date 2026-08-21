@@ -86,12 +86,42 @@ describe("Metrics", () => {
         quota_exceeded_total: 0,
         rooms_live: 3,
         sockets_live: 6,
+        shard_reject_total: 0,
+        shard_map_reloads_total: 0,
+        shard_map_fetch_errors_total: 0,
+        shard_map_version: -1,
+        shard_owned_buckets: 0,
+        shard_draining_buckets: 0,
       });
     });
 
-    it("defaults every field to 0 on a fresh registry", () => {
+    it("includes the shard counters and gauges in the push payload", () => {
+      // The push payload is the ONLY off-box surface in the loopback-/metrics
+      // posture, so reshard adoption, drain progress, ownership, and fetch
+      // failures must all ride it or a distributed fleet is operated blind.
+      const m = new Metrics();
+      m.inc("shard_reject_total", 4);
+      m.inc("shard_map_reloads_total", 2);
+      m.inc("shard_map_fetch_errors_total", 1);
+      const snap = m.snapshot({
+        rooms_live: 0, sockets_live: 0,
+        shard_map_version: 7, shard_owned_buckets: 32768, shard_draining_buckets: 3,
+      });
+      expect(snap.shard_reject_total).toBe(4);
+      expect(snap.shard_map_reloads_total).toBe(2);
+      expect(snap.shard_map_fetch_errors_total).toBe(1);
+      expect(snap.shard_map_version).toBe(7);
+      expect(snap.shard_owned_buckets).toBe(32768);
+      expect(snap.shard_draining_buckets).toBe(3);
+    });
+
+    it("defaults every field to 0 on a fresh registry (map version -1 = none)", () => {
       const snap = new Metrics().snapshot();
-      expect(Object.values(snap).every((v) => v === 0)).toBe(true);
+      // shard_map_version is a gauge whose "no map adopted" sentinel is -1
+      // (matching /metrics); every other field starts at 0.
+      expect(snap.shard_map_version).toBe(-1);
+      const { shard_map_version, ...rest } = snap;
+      expect(Object.values(rest).every((v) => v === 0)).toBe(true);
     });
   });
 });

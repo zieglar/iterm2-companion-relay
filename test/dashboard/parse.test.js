@@ -14,6 +14,12 @@ relay_process_exceptions_total 2
 relay_quota_exceeded_total 5
 relay_rooms_live 3
 relay_sockets_live 2
+relay_shard_reject_total 6
+relay_shard_map_reloads_total 2
+relay_shard_map_fetch_errors_total 1
+relay_shard_map_version 9
+relay_shard_owned_buckets 32768
+relay_shard_draining_buckets 4
 # TYPE relay_socket_lifetime_seconds histogram
 relay_socket_lifetime_seconds_bucket{le="1"} 12
 relay_socket_lifetime_seconds_bucket{le="5"} 12
@@ -50,6 +56,26 @@ describe("parseMetrics", () => {
     expect(s.life_le1800).toBe(14);
     expect(s.life_count).toBe(14);
     expect(s.life_sum).toBeCloseTo(486.899, 3);
+  });
+
+  it("captures the shard counters and gauges", () => {
+    const s = parseMetrics(SAMPLE);
+    expect(s.shard_reject).toBe(6);
+    expect(s.shard_map_reloads).toBe(2);
+    expect(s.shard_map_fetch_errors).toBe(1);
+    expect(s.shard_map_version).toBe(9);
+    expect(s.shard_owned_buckets).toBe(32768);
+    expect(s.shard_draining_buckets).toBe(4);
+  });
+
+  it("defaults the shard fields when the relay renders none (direct mode)", () => {
+    // A direct-mode relay renders no shard gauges at all; the map-version
+    // sentinel for "no map" is -1 (matching the relay's own gauge), counters 0.
+    const s = parseMetrics("relay_sockets_live 5\n");
+    expect(s.shard_map_version).toBe(-1);
+    expect(s.shard_reject).toBe(0);
+    expect(s.shard_owned_buckets).toBe(0);
+    expect(s.shard_draining_buckets).toBe(0);
   });
 
   it("defaults every field to 0 on empty input", () => {

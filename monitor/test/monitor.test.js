@@ -8,7 +8,7 @@ import {
   median, pushSample, hourKey, hourOfWeek,
   capAlerts, errorAlert, exceptionAlert, livenessAlert, anomalyAlert,
   normalizeSnapshot, deltas, rollHour, parseConfig, analyze, dueAlerts,
-  probeHandshake, probeAlert,
+  probeHandshake, probeAlert, shardFetchErrorAlert,
 } from "../src/monitor.js";
 import { run } from "../src/worker.js";
 
@@ -152,11 +152,29 @@ describe("anomalyAlert", () => {
   });
 });
 
+describe("shardFetchErrorAlert", () => {
+  it("is silent at zero", () => {
+    expect(shardFetchErrorAlert({ count: 0, threshold: 1 })).toBe(null);
+  });
+  it("warns at the threshold", () => {
+    const a = shardFetchErrorAlert({ count: 1, threshold: 1 });
+    expect(a.key).toBe("shard_fetch");
+    expect(a.severity).toBe("warn");
+  });
+  it("escalates to critical at 5x the threshold", () => {
+    expect(shardFetchErrorAlert({ count: 5, threshold: 1 }).severity).toBe("critical");
+  });
+});
+
 describe("normalizeSnapshot", () => {
   it("splits a pushed snapshot into counters and gauges, defaulting to 0", () => {
     const n = normalizeSnapshot({ http_requests_total: 40, http_errors_total: 2, sockets_live: 6 });
-    expect(n.counters).toEqual({ requests: 40, errors: 2, exceptions: 0 });
+    expect(n.counters).toEqual({ requests: 40, errors: 2, exceptions: 0, shardMapFetchErrors: 0 });
     expect(n.gauges).toEqual({ socketsLive: 6, roomsLive: 0 });
+  });
+  it("carries the shard fetch-error counter from a distributed-mode push", () => {
+    const n = normalizeSnapshot({ shard_map_fetch_errors_total: 3 });
+    expect(n.counters.shardMapFetchErrors).toBe(3);
   });
 });
 
@@ -165,12 +183,21 @@ describe("deltas", () => {
     expect(deltas(null, { requests: 5, errors: 0, exceptions: 0 }).reset).toBe(true);
   });
   it("diffs monotonic counters", () => {
-    const d = deltas({ requests: 100, errors: 1, exceptions: 0 }, { requests: 160, errors: 4, exceptions: 2 });
-    expect(d).toEqual({ reset: false, requests: 60, errors: 3, exceptions: 2 });
+    const d = deltas({ requests: 100, errors: 1, exceptions: 0, shardMapFetchErrors: 1 },
+      { requests: 160, errors: 4, exceptions: 2, shardMapFetchErrors: 3 });
+    expect(d).toEqual({ reset: false, requests: 60, errors: 3, exceptions: 2, shardMapFetchErrors: 2 });
   });
   it("flags reset when any counter goes backwards (relay restart)", () => {
     const d = deltas({ requests: 100, errors: 5, exceptions: 0 }, { requests: 3, errors: 0, exceptions: 0 });
     expect(d.reset).toBe(true);
+  });
+  it("tolerates a prior snapshot stored before the shard counter existed", () => {
+    // KV state written by an older monitor build has no shardMapFetchErrors;
+    // the delta must come out 0 (not NaN) and not flag a reset.
+    const d = deltas({ requests: 100, errors: 0, exceptions: 0 },
+      { requests: 110, errors: 0, exceptions: 0, shardMapFetchErrors: 2 });
+    expect(d.reset).toBe(false);
+    expect(d.shardMapFetchErrors).toBe(2);
   });
 });
 
@@ -241,6 +268,15 @@ describe("analyze", () => {
     const interval = { reset: true, requests: 0, errors: 0, exceptions: 0 };
     const { alerts } = analyze({ gauges, interval, lastHour: null }, {}, CONFIG);
     expect(alerts.some((a) => a.key === "errors" || a.key === "exceptions")).toBe(false);
+  });
+
+  it("raises a shard fetch-error alert when the relay cannot refresh the map", () => {
+    // A distributed-mode host that cannot fetch the map serves last-known-good
+    // ownership indefinitely (by design), so a climbing fetch-error counter is
+    // the operator's only cue to intervene; it must page.
+    const interval = { ...okInterval, shardMapFetchErrors: 2 };
+    const { alerts } = analyze({ gauges, interval, lastHour: null }, {}, CONFIG);
+    expect(alerts.some((a) => a.key === "shard_fetch")).toBe(true);
   });
 
   it("records the completed hour into the per-hour-of-week history once", () => {

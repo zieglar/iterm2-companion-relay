@@ -156,6 +156,18 @@ const TILES = [
     status: (t) => t.quota_closes > 0 ? "warn" : "good", note: () => "in range" },
   { k: "push_errors", label: "Push errors", fmt: num,
     status: (t) => t.push_errors > 0 ? "warn" : "good", note: () => "in range" },
+  // One tile covers sharding. Direct mode (map version -1): "direct", always
+  // good. Distributed: the adopted version, with ownership/drain/reject detail
+  // in the note. Fetch errors turn it warn: a host that cannot refresh the map
+  // serves last-known-good indefinitely by design, so this is the signal that
+  // an operator must look at the box (and hard-stop it to complete a drain).
+  { k: "shard_map_version", label: "Shard map",
+    fmt: (v) => v == null || v < 0 ? "direct" : "v" + num(v),
+    status: (t) => t.shard_map_version >= 0 && t.shard_map_fetch_errors > 0 ? "warn" : "good",
+    note: (t) => t.shard_map_version < 0 ? "single host" :
+      num(t.shard_owned_buckets) + " owned · " + num(t.shard_draining_buckets) + " draining" +
+      (t.shard_rejects > 0 ? " · " + num(t.shard_rejects) + " rejects" : "") +
+      (t.shard_map_fetch_errors > 0 ? " · " + num(t.shard_map_fetch_errors) + " fetch errors" : "") },
 ];
 
 // --- charts: [key, title, color-var, value formatter, y-unit] ------------------

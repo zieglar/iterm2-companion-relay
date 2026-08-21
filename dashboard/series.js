@@ -120,6 +120,17 @@ export function buildDashboard(rows, {
     exceptions,
     push_errors: windowTotal(rows, "push_errors"),
     quota_closes: windowTotal(rows, "quota_exceeded"),
+    // Shard state: gauges from the newest sample, counters as reset-aware
+    // window totals. Direct mode shows version -1 (no map) and zeros; the page
+    // renders that as "direct". shard_map_fetch_errors is THE stale-map alarm:
+    // a partitioned host serves last-known-good forever by design (§8), so a
+    // climbing value here is the operator's cue to intervene.
+    shard_map_version: cur ? (cur.shard_map_version ?? -1) : -1,
+    shard_owned_buckets: cur ? (cur.shard_owned_buckets || 0) : 0,
+    shard_draining_buckets: cur ? (cur.shard_draining_buckets || 0) : 0,
+    shard_rejects: windowTotal(rows, "shard_reject"),
+    shard_map_reloads: windowTotal(rows, "shard_map_reloads"),
+    shard_map_fetch_errors: windowTotal(rows, "shard_map_fetch_errors"),
     closed,
     short_lived_pct: closed > 0 ? +((shortLived / closed) * 100).toFixed(1) : 0,
     avg_lifetime_s: closed > 0 ? +(lifeSum / closed).toFixed(1) : 0,

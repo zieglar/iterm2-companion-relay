@@ -6,7 +6,10 @@ const row = (ts, o = {}) => ({
   ts, ws_upgrades: 0, ws_rejected: 0, http_requests: 0, http_errors: 0,
   exceptions: 0, push_errors: 0, quota_exceeded: 0, rooms_live: 0, sockets_live: 0,
   life_le1: 0, life_le5: 0, life_le15: 0, life_le60: 0, life_le300: 0, life_le1800: 0,
-  life_count: 0, life_sum: 0, ...o,
+  life_count: 0, life_sum: 0,
+  shard_reject: 0, shard_map_reloads: 0, shard_map_fetch_errors: 0,
+  shard_map_version: -1, shard_owned_buckets: 0, shard_draining_buckets: 0,
+  ...o,
 });
 
 describe("buildDashboard tiles", () => {
@@ -65,6 +68,29 @@ describe("buildDashboard tiles", () => {
     const rows = [row(1000)];
     const d = buildDashboard(rows, { latest: rows[0], fromMs: 0, toMs: 5000, nowMs: 5000 });
     expect(d.tiles.stale_ms).toBe(4000);
+  });
+
+  it("surfaces shard state: current gauges plus window totals of the counters", () => {
+    const rows = [
+      row(1000, { shard_map_version: 8, shard_owned_buckets: 100, shard_reject: 0, shard_map_reloads: 3, shard_map_fetch_errors: 0 }),
+      row(2000, { shard_map_version: 9, shard_owned_buckets: 80, shard_draining_buckets: 2, shard_reject: 6, shard_map_reloads: 4, shard_map_fetch_errors: 1 }),
+    ];
+    const d = buildDashboard(rows, { latest: rows[1], fromMs: 0, toMs: 3000, nowMs: 3000 });
+    expect(d.tiles.shard_map_version).toBe(9);
+    expect(d.tiles.shard_owned_buckets).toBe(80);
+    expect(d.tiles.shard_draining_buckets).toBe(2);
+    expect(d.tiles.shard_rejects).toBe(6);         // window total (reset-aware)
+    expect(d.tiles.shard_map_reloads).toBe(1);     // 4 - 3
+    expect(d.tiles.shard_map_fetch_errors).toBe(1);
+  });
+
+  it("reports direct mode as map version -1 with zeroed shard tiles", () => {
+    const rows = [row(1000)];
+    const d = buildDashboard(rows, { latest: rows[0], fromMs: 0, toMs: 2000, nowMs: 2000 });
+    expect(d.tiles.shard_map_version).toBe(-1);
+    expect(d.tiles.shard_owned_buckets).toBe(0);
+    expect(d.tiles.shard_draining_buckets).toBe(0);
+    expect(d.tiles.shard_rejects).toBe(0);
   });
 });
 
