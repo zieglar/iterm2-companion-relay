@@ -14,14 +14,19 @@
 //
 // Time is injected (`now()` returns ms) so tests use a virtual clock and never
 // sleep. Token bucket: tokens accrue at `evictionRatePerSec` (capped at one
-// second's worth) from construction, and are spent only on rooms of
-// past-deadline buckets, so the drain starts with at most one second's burst and
-// then paces at the rate.
+// second's worth, but never below one whole token, or a sub-1 rate could never
+// evict anything) from construction, and are spent only on rooms of
+// past-deadline buckets, so the drain starts with at most one second's burst
+// (at least one room) and then paces at the rate.
 
 export class DrainScheduler {
   constructor({ drainDelayMs, evictionRatePerSec, now, evict, liveRooms }) {
     this._drainDelayMs = drainDelayMs;
     this._rate = evictionRatePerSec;
+    // The burst cap. A fractional rate (say 0.5 rooms/second) must still reach
+    // a whole token or run() would skip every room forever; capping at >= 1
+    // preserves the pacing (one room per 1/rate seconds) with a one-room burst.
+    this._cap = Math.max(1, evictionRatePerSec);
     this._now = now;
     this._evict = evict;
     this._liveRooms = liveRooms;
@@ -47,21 +52,29 @@ export class DrainScheduler {
 
   run() {
     const t = this._now();
-    this._tokens = Math.min(this._rate, this._tokens + ((t - this._lastRunMs) * this._rate) / 1000);
+    this._tokens = Math.min(this._cap, this._tokens + ((t - this._lastRunMs) * this._rate) / 1000);
     this._lastRunMs = t;
 
     const evicted = [];
     for (const [bucket, ep] of this._draining) {
       if (ep.deadline > t) continue; // still deferring this bucket
+      // A room left un-evicted for lack of tokens keeps the episode alive; a
+      // pass that evicts (or has already evicted) every live room completes it.
+      let starved = false;
       for (const id of this._liveRooms(bucket)) {
-        if (this._tokens < 1) break;
         if (ep.evicted.has(id)) continue; // already evicted in THIS episode
+        if (this._tokens < 1) { starved = true; break; }
         this._tokens -= 1;
         ep.evicted.add(id);
         this._evict(id);
         evicted.push(id);
       }
-      if (this._tokens < 1) break; // global rate: stop scanning further buckets
+      // Episode complete: every live room of this bucket has been evicted (or
+      // there were none). Drop it so the draining gauge returns to 0 and later
+      // ticks stop rescanning a dead bucket; a fresh relinquish starts a fresh
+      // episode. (Deleting the current entry during Map iteration is safe.)
+      if (!starved) this._draining.delete(bucket);
+      if (starved) break; // global rate: stop scanning further buckets
     }
     return evicted;
   }

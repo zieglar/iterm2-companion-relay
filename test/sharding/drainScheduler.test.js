@@ -131,6 +131,80 @@ describe("DrainScheduler: re-relinquish after a bucket ping-pongs back", () => {
   });
 });
 
+describe("DrainScheduler: sub-1 eviction rates still drain", () => {
+  it("a 0.5 rooms/second rate evicts one room every two seconds, not never", () => {
+    // Regression: the token cap was min(rate, ...), so any rate in (0,1) could
+    // never accumulate a whole token and the drain silently never fired.
+    const h = harness({ drainDelayMs: 20_000, evictionRatePerSec: 0.5 });
+    h.addRooms(1, nRooms(1, 3));
+    h.sched.relinquish(1);
+
+    h.setTime(20_000); h.sched.run();
+    expect(h.evicted.length).toBe(1);           // 20s of accrual, capped at one room
+
+    h.setTime(21_000); h.sched.run();
+    expect(h.evicted.length).toBe(1);           // half a token: not yet
+
+    h.setTime(22_000); h.sched.run();
+    expect(h.evicted.length).toBe(2);           // a full token every 2 seconds
+
+    h.setTime(24_000); h.sched.run();
+    expect(h.evicted.length).toBe(3);
+  });
+});
+
+describe("DrainScheduler: completed episodes are removed", () => {
+  it("drops a fully drained bucket so the draining gauge returns to 0", () => {
+    const h = harness({ drainDelayMs: 20_000, evictionRatePerSec: 10 });
+    h.addRooms(1, nRooms(1, 5));
+    h.sched.relinquish(1);
+    expect(h.sched.drainingCount).toBe(1);
+    h.setTime(20_000); h.sched.run();           // all 5 fit in one burst
+    expect(h.evicted.length).toBe(5);
+    expect(h.sched.drainingBuckets.has(1)).toBe(false);
+    expect(h.sched.drainingCount).toBe(0);
+  });
+
+  it("keeps a bucket draining while rooms remain for lack of tokens", () => {
+    const h = harness({ drainDelayMs: 20_000, evictionRatePerSec: 10 });
+    h.addRooms(1, nRooms(1, 25));
+    h.sched.relinquish(1);
+    h.setTime(20_000); h.sched.run();           // 10 of 25
+    expect(h.sched.drainingBuckets.has(1)).toBe(true);
+    h.setTime(21_000); h.sched.run();           // 20 of 25
+    expect(h.sched.drainingBuckets.has(1)).toBe(true);
+    h.setTime(22_000); h.sched.run();           // all 25 done
+    expect(h.evicted.length).toBe(25);
+    expect(h.sched.drainingCount).toBe(0);
+  });
+
+  it("clears a relinquished bucket that has no live rooms once its deadline passes", () => {
+    const h = harness({ drainDelayMs: 20_000, evictionRatePerSec: 10 });
+    h.sched.relinquish(7);                      // no rooms in bucket 7
+    h.setTime(19_999); h.sched.run();
+    expect(h.sched.drainingBuckets.has(7)).toBe(true);   // still deferring
+    h.setTime(20_000); h.sched.run();
+    expect(h.sched.drainingBuckets.has(7)).toBe(false);  // nothing to drain
+  });
+
+  it("completes even when an evicted room lingers in the live set", () => {
+    // Like the lingering-room test above: liveRooms keeps returning the room
+    // after eviction. The episode must still complete rather than pinning the
+    // bucket in the draining set forever.
+    let t = 0;
+    const evicted = [];
+    const sched = new DrainScheduler({
+      drainDelayMs: 20_000, evictionRatePerSec: 10,
+      now: () => t, evict: (id) => evicted.push(id), liveRooms: () => ["stuck"],
+    });
+    sched.relinquish(1);
+    t = 20_000; sched.run();
+    expect(evicted).toEqual(["stuck"]);
+    t = 21_000; sched.run();
+    expect(sched.drainingCount).toBe(0);
+  });
+});
+
 describe("DrainScheduler: recompute deadline", () => {
   it("resets the deadline when a bucket is relinquished again", () => {
     const h = harness({ drainDelayMs: 20_000, evictionRatePerSec: 10 });
