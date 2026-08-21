@@ -209,6 +209,14 @@ proxy → WS upgrade → admission) is failing where the metrics push can't see 
   week baseline. A **drop** can be an early outage signal; a **spike** can be
   abuse. Silent until the baseline has `MIN_SAMPLES` weeks — expect no anomaly
   alerts for the first couple of weeks after deploy.
+- **Shard-map fetch errors** (`Shard-map fetch errors: N`): a distributed-mode
+  relay failed to refresh `shardmap.json` since the last check. The relay keeps
+  serving its **last-known-good** map (by design: never fail-open/closed), so
+  nothing is down *yet*, but a host that cannot see map changes will not observe
+  a reshard: it keeps serving buckets it no longer owns and never starts its
+  drain. If it persists, fix the box's egress to the resolver; if it persists
+  **across a reshard**, hard-stop the host to complete the drain. Full
+  procedure: `ops/SHARDING.md`. (Direct-mode relays never fire this.)
 
 ---
 

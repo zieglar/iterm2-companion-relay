@@ -33,8 +33,9 @@ relay itself.
 > running several of your own boxes behind a static shard map, so load spreads
 > across hosts and you can add or drain them without breaking pairings. That is a
 > fleet feature: enable it by setting `RELAY_SHARDMAP_URL` + `RELAY_SELF_HOST`
-> (see `ops/relay.env.example`) and read the design in the relay sharding design
-> doc. Everything else in this guide applies to a single box in either mode.
+> (see `ops/relay.env.example`), read the design in
+> `docs/companion-relay-design.md`, and operate it with `ops/SHARDING.md`.
+> Everything else in this guide applies to a single box in either mode.
 
 > **What about deploying to Cloudflare Workers?** This relay originally ran as a
 > Cloudflare Worker + Durable Object, and that code still lives in the git

@@ -48,6 +48,14 @@ gray-cloud DNS-only, IPv4-only).
 `phone_no_mac_total`, the always-on connect/park/disconnect log lines, the `ss`
 leg-balance check, and `SIGUSR1` to toggle verbose `RELAY_LOG` without a restart).
 
+## Sharding (distributed mode)
+
+`docs/companion-relay-design.md` is the authoritative design (the §6.x / §7.4
+references throughout `src/sharding/` point at it). `ops/SHARDING.md` is the
+operator runbook: reshard, drain a box to empty, failure modes. The map is
+served by the Cloudflare Worker in `resolver/` with `max-age=5`; that TTL is a
+design invariant (client re-resolve correctness), not a tuning knob.
+
 ## Test
 
 `npm test` — vitest, all in plain Node.
