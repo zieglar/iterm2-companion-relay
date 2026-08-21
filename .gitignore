@@ -9,5 +9,8 @@ dist/
 *.db
 *.db-shm
 *.db-wal
-# Filled-in deploy config: holds the dashboard password / push token. Never commit.
+# Filled-in deploy configs: hold the dashboard password / push token. Never
+# commit. The glob covers per-host variants (deploy-relay2.env, ...) while
+# still tracking deploy.env.example.
 ops/deploy.env
+ops/deploy-*.env
