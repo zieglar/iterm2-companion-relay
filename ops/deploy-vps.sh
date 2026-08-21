@@ -189,7 +189,11 @@ echo "==> Installing relay systemd unit${RELAY_SERVICE_USER:+ (User=${RELAY_SERV
 render_unit "${APP_DIR}/ops/iterm2-companion-relay.service" "$RELAY_SERVICE_USER" \
   | sudo tee /etc/systemd/system/iterm2-companion-relay.service >/dev/null
 sudo systemctl daemon-reload
-sudo systemctl enable --now iterm2-companion-relay
+# enable + restart, not `enable --now`: --now only starts a STOPPED unit, so a
+# re-deploy onto a live box would leave the old process running with the old
+# code and env. restart covers both cases (it starts a stopped unit too).
+sudo systemctl enable iterm2-companion-relay
+sudo systemctl restart iterm2-companion-relay
 
 # ── Dashboard env + service (optional) ────────────────────────────────────────
 if is_true "$ENABLE_DASHBOARD"; then
@@ -224,7 +228,8 @@ RELAY_MAX_ROOMS=200000" | sudo tee /etc/iterm2-relay-dashboard.env >/dev/null
     | sudo tee /etc/systemd/system/iterm2-relay-dashboard.service >/dev/null
   rm -f "$dash_unit_tmp"
   sudo systemctl daemon-reload
-  sudo systemctl enable --now iterm2-relay-dashboard
+  sudo systemctl enable iterm2-relay-dashboard
+  sudo systemctl restart iterm2-relay-dashboard
 fi
 
 # ── Caddy site ────────────────────────────────────────────────────────────────
