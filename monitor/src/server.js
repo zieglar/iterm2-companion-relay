@@ -238,7 +238,10 @@ function row(k, v) {
   return `<div class=r><span class=k>${esc(k)}</span><span class=v>${esc(v)}</span></div>`;
 }
 
-function cardHtml(h) {
+// detailTpl: a URL template with a {host} placeholder pointing at each shard's
+// own detailed dashboard (e.g. "https://{host}/dashboard/"). When set and the host
+// is a real hostname, the whole card becomes a link to that shard's detail view.
+function cardHtml(h, detailTpl) {
   const rows = [row("seen", h.ageMs == null ? "never" : `${ago(h.ageMs)} ago`)];
   if (h.sockets != null) rows.push(row("sockets", h.sockets));
   if (h.rooms != null) rows.push(row("rooms", h.rooms));
@@ -246,9 +249,13 @@ function cardHtml(h) {
   rows.push(row("inbound", h.probeOk == null ? "-" : (h.probeOk ? "ok" : "FAILING")));
   const why = h.status !== "ok" && h.reasons && h.reasons.length
     ? `<div class=why>${esc(h.reasons.join(", "))}</div>` : "";
-  return `<div class="card ${esc(h.status)}"><div class=top><span class=host>${esc(h.host)}</span>`
+  const inner = `<div class=top><span class=host>${esc(h.host)}</span>`
     + `<span class="badge ${esc(h.status)}">${esc(h.status.toUpperCase())}</span></div>`
-    + `<div class=rows>${rows.join("")}</div>${why}</div>`;
+    + `<div class=rows>${rows.join("")}</div>${why}`;
+  const url = detailTpl && h.host.includes(".") ? detailTpl.replace("{host}", h.host) : null;
+  return url
+    ? `<a class="card link ${esc(h.status)}" href="${esc(url)}" target="_blank" rel="noopener">${inner}<div class=open>detail &#8599;</div></a>`
+    : `<div class="card ${esc(h.status)}">${inner}</div>`;
 }
 
 const DASH_CSS = `
@@ -266,6 +273,9 @@ h1{font-size:18px;margin:0 0 12px}.muted{color:var(--muted)}
 .grid{display:grid;gap:12px;grid-template-columns:repeat(auto-fill,minmax(230px,1fr))}
 .card{background:var(--card);border:1px solid var(--line);border-left:5px solid var(--muted);border-radius:10px;padding:14px}
 .card.ok{border-left-color:var(--ok)}.card.warn{border-left-color:var(--warn)}.card.crit{border-left-color:var(--crit)}
+a.card{display:block;text-decoration:none;color:inherit;transition:box-shadow .1s,transform .1s}
+a.card:hover{box-shadow:0 2px 12px rgba(0,0,0,.18);transform:translateY(-1px)}
+.open{margin-top:8px;font-size:12px;color:var(--muted)}
 .top{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px}
 .host{font-weight:600;word-break:break-all}
 .badge{font-size:11px;font-weight:700;padding:2px 8px;border-radius:999px;color:#fff;white-space:nowrap}
@@ -311,7 +321,7 @@ async function liveHealth(env, kv, now) {
   return { ...health, hosts, summary, at: now, probeAt: health.at };
 }
 
-function renderDashboard(health, now) {
+function renderDashboard(health, now, detailTpl) {
   const head = (title, refresh) =>
     `<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">`
     + `<meta http-equiv=refresh content=${refresh}><title>${esc(title)}</title><style>${DASH_CSS}</style>`;
@@ -326,7 +336,7 @@ function renderDashboard(health, now) {
     : "all systems normal";
   const cards = health.hosts.slice()
     .sort((a, b) => rank(b.status) - rank(a.status) || a.host.localeCompare(b.host))
-    .map(cardHtml).join("");
+    .map((h) => cardHtml(h, detailTpl)).join("");
   const mapLine = health.fleet ? `map v${esc(health.mapVersion ?? "?")}` : "direct mode";
   const banner = health.mapError ? `<div class=banner>shard map fetch failed: ${esc(health.mapError)}</div>` : "";
   return `${head(`Relay fleet ${s.crit ? "⚠" : ""}`.trim(), 30)}<div class=wrap>`
@@ -388,8 +398,11 @@ export function createServer(env, deps) {
       }
       const now = Date.now();
       const health = await liveHealth(env, kv, now); // live liveness/gauges, tick's probe
+      // Per-shard detail link. Default to each host's own dashboard; a deployment
+      // can override or set empty to disable the links.
+      const detailTpl = "DASHBOARD_URL_TEMPLATE" in env ? env.DASHBOARD_URL_TEMPLATE : "https://{host}/dashboard/";
       res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
-      res.end(renderDashboard(health, now));
+      res.end(renderDashboard(health, now, detailTpl));
       return;
     }
 

@@ -219,6 +219,32 @@ describe("createServer - /dashboard (fleet health page)", () => {
     expect(html).toContain("relay2.iterm2.com");
     expect(html).toContain("1/2 healthy");
     expect(html).toMatch(/CRIT/);
+    // each card links to that shard's own detailed dashboard (default template)
+    expect(html).toContain('href="https://relay1.iterm2.com/dashboard/"');
+    expect(html).toContain('href="https://relay2.iterm2.com/dashboard/"');
+    expect(html).toContain('target="_blank"');
+  });
+
+  it("uses a custom DASHBOARD_URL_TEMPLATE and can disable links with an empty one", async () => {
+    const seed = async (kv) => {
+      await kv.put("health", JSON.stringify({
+        at: Date.now(), fleet: true, mapError: null, mapVersion: 2,
+        summary: { total: 1, ok: 1, warn: 0, crit: 0 },
+        hosts: [{ host: "relay1.iterm2.com", status: "ok", ageMs: 5000, sockets: 1, rooms: 0, buckets: 61440, probeOk: true, reasons: [] }],
+        due: [],
+      }));
+      await kv.put("latest:relay1.iterm2.com", JSON.stringify({ receivedAt: Date.now(), snapshot: { sockets_live: 1 } }));
+    };
+    const kvA = fileStore(tmpDir()); await seed(kvA);
+    const a = await listen(createServer({ ...env, DASHBOARD_URL_TEMPLATE: "https://ops.example/d/{host}" }, { kv: kvA }));
+    const htmlA = await (await fetch(`${a}/dashboard`, { headers: { authorization: auth } })).text();
+    expect(htmlA).toContain('href="https://ops.example/d/relay1.iterm2.com"');
+
+    const kvB = fileStore(tmpDir()); await seed(kvB);
+    const b = await listen(createServer({ ...env, DASHBOARD_URL_TEMPLATE: "" }, { kv: kvB }));
+    const htmlB = await (await fetch(`${b}/dashboard`, { headers: { authorization: auth } })).text();
+    expect(htmlB).not.toContain("<a class=\"card");
+    expect(htmlB).toContain("relay1.iterm2.com"); // still shown, just not linked
   });
 
   it("shows a collecting-data page before the first tick", async () => {

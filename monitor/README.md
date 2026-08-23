@@ -144,8 +144,13 @@ A single at-a-glance health page for the whole fleet, served by the monitor at
 **`GET /dashboard`** (HTTP Basic auth; any username, password = `MANUAL_TRIGGER_SECRET`).
 One color-coded card per relay (green ok / amber degraded / red down or
 inbound-failing) with just the essentials - last-seen, live sockets/rooms, owned
-buckets, inbound probe - plus an "X of Y healthy" header. It renders from the last
-tick's snapshot (no re-probing on load) and auto-refreshes every 30s.
+buckets, inbound probe - plus an "X of Y healthy" header. Liveness and gauges are
+recomputed live on each load (no re-probing); the probe result is as of the last
+tick. Auto-refreshes every 30s.
+
+**Click a card** to open that shard's own detailed dashboard. The link comes from
+`DASHBOARD_URL_TEMPLATE` (default `https://{host}/dashboard/`, matching the managed
+fleet); set it empty to disable the links.
 
 Reach it either by adding one reverse-proxy route (e.g. Apache
 `ProxyPass /fleet http://127.0.0.1:8790/dashboard`) or, with no server change, an
