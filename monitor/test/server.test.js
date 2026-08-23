@@ -207,6 +207,9 @@ describe("createServer - /dashboard (fleet health page)", () => {
       ],
       due: [],
     }));
+    // The dashboard recomputes liveness live from latest:<host>: relay1 has a
+    // fresh snapshot (stays ok), relay2 has none (stays crit) -> 1/2 healthy.
+    await kv.put("latest:relay1.iterm2.com", JSON.stringify({ receivedAt: Date.now(), snapshot: { sockets_live: 3, rooms_live: 2 } }));
     const base = await listen(createServer(env, { kv }));
     const res = await fetch(`${base}/dashboard`, { headers: { authorization: auth } });
     expect(res.status).toBe(200);

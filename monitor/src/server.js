@@ -26,7 +26,7 @@ import { randomBytes, timingSafeEqual } from "node:crypto";
 import { WebSocket } from "ws";
 
 import { run, LATEST_KEY, latestKeyFor, HEALTH_KEY } from "./core.js";
-import { probeHandshake, ownedRoomForHost } from "./monitor.js";
+import { probeHandshake, ownedRoomForHost, parseConfig, normalizeSnapshot } from "./monitor.js";
 import { fileStore } from "./store.js";
 
 // --- auth helpers ---
@@ -275,6 +275,42 @@ h1{font-size:18px;margin:0 0 12px}.muted{color:var(--muted)}
 .why{margin-top:8px;font-size:12px;color:var(--crit);word-break:break-word}
 `;
 
+// The persisted HEALTH doc is only rewritten each analysis tick (minutes apart),
+// so a relay that recovered between ticks would still read as down. On every
+// dashboard load, recompute the cheap, latency-sensitive parts -- "is it
+// reporting?" and the live gauges -- from the per-host latest snapshots (local
+// reads, no probing), keeping the tick's probe result and slower interval-based
+// warnings (errors/exceptions/anomaly) as-is. This keeps liveness on the page
+// current without probing relays on every refresh.
+async function liveHealth(env, kv, now) {
+  const health = await kv.get(HEALTH_KEY, "json");
+  if (!health || !Array.isArray(health.hosts)) return health;
+  const cfg = parseConfig(env);
+  const hosts = await Promise.all(health.hosts.map(async (h) => {
+    const latest = await kv.get(health.fleet ? `latest:${h.host}` : LATEST_KEY, "json");
+    const ageMs = latest ? now - latest.receivedAt : null;
+    const reporting = !!latest && ageMs <= cfg.staleMs;
+    const gauges = latest ? normalizeSnapshot(latest.snapshot).gauges : null;
+    const probeFailing = h.probeOk === false;
+    const otherWarn = (h.reasons || []).some((k) => k !== "liveness" && k !== "probe");
+    const reasons = (h.reasons || []).filter((k) => k !== "liveness");
+    if (!reporting) reasons.unshift("liveness");
+    return {
+      ...h,
+      ageMs,
+      sockets: gauges ? gauges.socketsLive : null,
+      rooms: gauges ? gauges.roomsLive : null,
+      status: (!reporting || probeFailing) ? "crit" : (otherWarn ? "warn" : "ok"),
+      reasons,
+    };
+  }));
+  const summary = hosts.reduce(
+    (c, s) => { c[s.status] += 1; c.total += 1; return c; },
+    { total: 0, ok: 0, warn: 0, crit: 0 },
+  );
+  return { ...health, hosts, summary, at: now, probeAt: health.at };
+}
+
 function renderDashboard(health, now) {
   const head = (title, refresh) =>
     `<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">`
@@ -295,7 +331,8 @@ function renderDashboard(health, now) {
   const banner = health.mapError ? `<div class=banner>shard map fetch failed: ${esc(health.mapError)}</div>` : "";
   return `${head(`Relay fleet ${s.crit ? "⚠" : ""}`.trim(), 30)}<div class=wrap>`
     + `<header class="hdr ${overall}"><div class=big>${s.ok}/${s.total} healthy</div>`
-    + `<div class=sub>${esc(sub)}</div><div class=meta>${mapLine} &middot; updated ${ago(now - health.at)} ago</div></header>`
+    + `<div class=sub>${esc(sub)}</div><div class=meta>${mapLine} &middot; updated ${ago(now - health.at)} ago`
+    + `${health.probeAt != null ? ` &middot; probes ${ago(now - health.probeAt)} ago` : ""}</div></header>`
     + `${banner}<div class=grid>${cards}</div></div>`;
 }
 
@@ -349,9 +386,10 @@ export function createServer(env, deps) {
         res.end("authentication required");
         return;
       }
-      const health = await kv.get(HEALTH_KEY, "json");
+      const now = Date.now();
+      const health = await liveHealth(env, kv, now); // live liveness/gauges, tick's probe
       res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
-      res.end(renderDashboard(health, Date.now()));
+      res.end(renderDashboard(health, now));
       return;
     }
 
