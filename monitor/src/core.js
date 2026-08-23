@@ -1,68 +1,129 @@
-// The transport-agnostic orchestration for one monitor tick. Extracted from the
-// old Cloudflare Worker's run() unchanged in logic; the only difference is that
-// its three side effects are now injected instead of hard-wired to Workers APIs:
+// The transport-agnostic orchestration for one monitor tick. Side effects are
+// injected so run() stays unit-tested with no network:
 //
-//   kv        - persistence         (fileStore in prod; a Map fake in tests)
-//   runProbe  - the outside-in probe (a real ws handshake in prod; a stub in tests)
-//   sendEmail - alert delivery       (Resend in prod; a stub in tests)
+//   kv          - persistence               (fileStore in prod; a Map fake in tests)
+//   sendEmail   - alert delivery             (Resend in prod; a stub in tests)
+//   fetchMap    - fetch+parse the shard map  (fetch in prod; a stub in tests)
+//   probeOne    - one host's ws handshake    (nodeProbe in prod; a stub in tests)
+//   roomForHost - an owned room for a host    (ownedRoomForHost in prod; a stub in tests)
 //
-// Keeping run() free of any concrete transport is what lets it stay unit-tested
-// with no network, exactly as it was under the Worker. The pure analysis lives in
-// monitor.js; this file only wires the checks to state and delivery.
+// The monitor is fleet-first: with SHARD_MAP_URL set, the shard map is the single
+// source of truth for WHICH hosts exist. Each tick we fetch it and, for every host
+// it names, check push freshness (liveness), the pushed gauges/counters (capacity,
+// errors, exceptions), and drive an owned-room inbound probe. Adding a relay to the
+// fleet is therefore zero monitor config: put it in the map and point its push at
+// /ingest/<host>; the monitor discovers it and starts watching. Without
+// SHARD_MAP_URL this degrades to a single direct-mode relay (one push key + an
+// optional random-room probe via RELAY_PROBE_URL), so a non-sharded self-host still
+// works. The pure analysis lives in monitor.js; this file wires it to state + I/O.
 
 import {
   parseConfig, normalizeSnapshot, deltas, rollHour, hourKey, analyze, dueAlerts,
   livenessAlert, probeAlert,
 } from "./monitor.js";
 
+// Direct-mode (no shard map) push lands under this single key; fleet-mode pushes
+// land under `latest:<host>`.
 export const LATEST_KEY = "latest";
 export const STATE_KEY = "state";
+export const DIRECT_HOST = "__direct__";
+
+export function latestKeyFor(host) {
+  return host === DIRECT_HOST ? LATEST_KEY : `latest:${host}`;
+}
+
+// Namespace a per-host alert so its cooldown, escalation, and clear-on-resolve are
+// independent per host, and the email names the host. Direct mode (single host)
+// keeps the bare keys/titles.
+function hostAlert(host, fleet, a) {
+  if (!fleet) return a;
+  return { ...a, key: `${host}|${a.key}`, title: `[${host}] ${a.title}` };
+}
+
+function hostOf(url) {
+  try { return new URL(url).host; } catch { return "relay"; }
+}
 
 // env: the flat config/secrets object (process.env in prod). now: ms timestamp.
-// deps: { dry, kv, runProbe, sendEmail }. Returns a summary for the dry-run/JSON
-// endpoints; when !dry it also persists state and (tries to) send due alerts.
-export async function run(env, now, { dry, kv, runProbe, sendEmail }) {
+// deps: { dry, kv, sendEmail, fetchMap, probeOne, roomForHost }.
+export async function run(env, now, { dry, kv, sendEmail, fetchMap, probeOne, roomForHost }) {
   const cfg = parseConfig(env);
-  const latest = await kv.get(LATEST_KEY, "json");
   const state = dry ? {} : ((await kv.get(STATE_KEY, "json")) || {});
-  const ageMs = latest ? now - latest.receivedAt : null;
+  const fleet = !!env.SHARD_MAP_URL;
 
-  let alerts;
-  const nextState = { ...state };
-  if (!latest || ageMs > cfg.staleMs) {
-    // Dead-man's-switch: no fresh push means the relay or its host is down.
-    // Preserve the metric-derived state (prev/anchor/history) so it resumes
-    // cleanly once pushes return.
-    const detail = latest ? `no snapshot for ${Math.round(ageMs / 60000)} min` : "no snapshot received yet";
-    alerts = [livenessAlert(detail)];
-  } else {
-    const snap = normalizeSnapshot(latest.snapshot);
-    const interval = deltas(state.prev, snap.counters);
-    const roll = rollHour(state.hourAnchor, snap.counters, hourKey(now));
-    const analyzed = analyze({ gauges: snap.gauges, interval, lastHour: roll.lastHour }, state, cfg);
-    alerts = analyzed.alerts;
-    nextState.history = analyzed.history;
-    nextState.lastRecordedHour = analyzed.lastRecordedHour;
-    nextState.prev = snap.counters;
-    nextState.hourAnchor = roll.anchor;
+  // Resolve the shard map (fleet mode). A map that can't be fetched or parsed is
+  // itself a pairing-critical failure: if the monitor can't resolve ownership,
+  // clients likely can't either, and we can't build owned rooms to probe with.
+  let map = null;
+  let mapError = null;
+  if (fleet && fetchMap) {
+    try { map = await fetchMap(env.SHARD_MAP_URL); }
+    catch (e) { mapError = String((e && e.message) || e); }
   }
 
-  // Independent outside-in synthetic probe: a real pairing handshake through
-  // the full inbound path. Catches the failure class the push cannot see --
-  // process up and pushing, but users can't connect. Opt-in via RELAY_PROBE_URL
-  // (single direct-mode relay, random room) or SHARD_MAP_URL (distributed
-  // fleet: every map host is probed with a room it owns; see fleetProbe).
-  let probe = null;
-  if ((env.RELAY_PROBE_URL || env.SHARD_MAP_URL) && runProbe) {
-    probe = await runProbe(
-      { probeUrl: env.RELAY_PROBE_URL || "", shardMapUrl: env.SHARD_MAP_URL || "" },
-      cfg.probeTimeoutMs,
-    );
+  // The hosts to watch this tick:
+  //  - fleet + map ok: exactly the hosts the map names (source of truth). Hosts
+  //    that dropped out of the map are no longer watched (drained/removed) and
+  //    their stale state is pruned below.
+  //  - fleet + map failed: fall back to hosts we watched last tick, so a map
+  //    outage doesn't blind liveness for relays we already know about.
+  //  - direct mode: one pseudo-host.
+  const prevHosts = Object.keys(state.hosts || {});
+  const hosts = fleet
+    ? (map ? mapHostsFrom(map) : prevHosts)
+    : [DIRECT_HOST];
+
+  const alerts = [];
+  const nextHosts = {}; // rebuilt from the hosts we actually processed -> prunes drained hosts
+  const summaries = [];
+
+  // A map-fetch failure pages once, fleet-wide, distinct from any per-host alert.
+  if (fleet && mapError) alerts.push(probeAlert(`shard map fetch failed: ${mapError}`));
+
+  for (const host of hosts) {
+    const latest = await kv.get(latestKeyFor(host), "json");
+    const ageMs = latest ? now - latest.receivedAt : null;
+    const hs = (state.hosts && state.hosts[host]) || {};
+
+    // --- push side: liveness + the pushed-metric checks ---
+    if (!latest || ageMs > cfg.staleMs) {
+      const detail = latest ? `no snapshot for ${Math.round(ageMs / 60000)} min` : "no snapshot received yet";
+      alerts.push(hostAlert(host, fleet, livenessAlert(detail)));
+      nextHosts[host] = hs; // preserve baselines so they resume when pushes return
+    } else {
+      const snap = normalizeSnapshot(latest.snapshot);
+      const interval = deltas(hs.prev, snap.counters);
+      const roll = rollHour(hs.hourAnchor, snap.counters, hourKey(now));
+      const analyzed = analyze({ gauges: snap.gauges, interval, lastHour: roll.lastHour }, hs, cfg);
+      for (const a of analyzed.alerts) alerts.push(hostAlert(host, fleet, a));
+      nextHosts[host] = {
+        prev: snap.counters, hourAnchor: roll.anchor,
+        history: analyzed.history, lastRecordedHour: analyzed.lastRecordedHour,
+      };
+    }
+
+    // --- inbound side: an owned-room handshake per host ---
+    let probe = null;
+    if (fleet && map && probeOne && roomForHost) {
+      const room = roomForHost(map, host);
+      if (room) { // null => host owns nothing (drained): nothing to probe
+        probe = await probeOne(`https://${host}/`, cfg.probeTimeoutMs, room);
+        if (!probe.ok) alerts.push(hostAlert(host, fleet, probeAlert(probe.detail)));
+      }
+    }
+    summaries.push({ host: fleet ? host : hostOf(env.RELAY_PROBE_URL || ""), ageMs, probe });
+  }
+
+  // Direct-mode probe: a single random-room handshake (no map to build an owned room).
+  if (!fleet && env.RELAY_PROBE_URL && probeOne) {
+    const probe = await probeOne(env.RELAY_PROBE_URL, cfg.probeTimeoutMs);
     if (!probe.ok) alerts.push(probeAlert(probe.detail));
+    if (summaries[0]) summaries[0].probe = probe;
   }
 
   const { due, sentAt } = dueAlerts(alerts, state.sentAt || {}, now, cfg.cooldownMs);
 
+  const nextState = { hosts: nextHosts };
   if (!dry) {
     let delivered = true;
     if (due.length) {
@@ -75,13 +136,21 @@ export async function run(env, now, { dry, kv, runProbe, sendEmail }) {
         console.error("relay-monitor: alert send failed:", (e && e.message) || e);
       }
     }
-    // Always advance the metric-derived state (prev/hourAnchor/history) so a send
-    // failure can't freeze the baselines. Advance the cooldown (sentAt) only when
-    // the send actually went out; otherwise keep the prior sentAt so the due
-    // alerts are due again next tick and retry, rather than being recorded as
-    // sent-but-undelivered (which would silently drop a real outage alert).
+    // Advance metric state always (so a send failure can't freeze baselines);
+    // advance the cooldown only when the send went out, so an undelivered alert
+    // is due again next tick instead of being silently recorded as sent.
     nextState.sentAt = delivered ? sentAt : (state.sentAt || {});
     await kv.put(STATE_KEY, JSON.stringify(nextState));
   }
-  return { ageMs, probe, alerts, due: due.map((a) => a.key) };
+  return { fleet, mapError, hosts: summaries, alerts, due: due.map((a) => a.key) };
+}
+
+// Local copy of the map->hosts projection so core doesn't depend on server; the
+// pure version in monitor.js (mapHosts) is what prod passes for probing.
+function mapHostsFrom(map) {
+  const hosts = [];
+  for (const r of (map && map.ranges) || []) {
+    if (r && typeof r.host === "string" && !hosts.includes(r.host)) hosts.push(r.host);
+  }
+  return hosts;
 }

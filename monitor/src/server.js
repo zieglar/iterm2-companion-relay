@@ -3,28 +3,30 @@
 // Why this exists: on Cloudflare the relay's ~1/min metrics push was one KV
 // write each, and KV's free tier caps writes at ~1000/day, so the monitor ran
 // out of quota every afternoon and emailed about it. Running here, on a Linux
-// box you control (ideally a DIFFERENT provider from the relays, so a provider
-// outage can't take down both the relay and the thing that watches it), the
-// snapshot lands in a local file with no write cap. No Cloudflare in the loop.
+// box you control, the snapshot lands in a local file with no write cap. No
+// Cloudflare in the loop.
 //
-// It does everything the Worker did:
-//   POST /ingest        (Authorization: Bearer INGEST_TOKEN)   <- the relay pushes here
-//   GET  /              (x-monitor-key: MANUAL_TRIGGER_SECRET)  -> dry-run analysis JSON
-//   GET  /?test=1       (x-monitor-key: MANUAL_TRIGGER_SECRET)  -> send a REAL test email
-// plus an internal timer (MONITOR_INTERVAL_MS, default 5 min) that runs the same
-// analysis the Worker's cron did.
+// Fleet-first (see core.js): with SHARD_MAP_URL set, the shard map is the source
+// of truth for which hosts exist. Relays push per-host to /ingest/<host>; the
+// monitor watches every host the map names and probes each with a room it owns.
+// Adding a relay is zero monitor config. Without SHARD_MAP_URL it degrades to a
+// single direct-mode relay pushing to /ingest.
 //
-// Run it behind Caddy (TLS) exactly like the relay: bind loopback here, let Caddy
-// terminate 443 on the monitor's hostname and reverse-proxy /ingest. See
-// ops/Caddyfile.example and ops/iterm2-relay-monitor.service.
+//   POST /ingest              (Authorization: Bearer INGEST_TOKEN)  direct-mode push
+//   POST /ingest/<host>       (Authorization: Bearer INGEST_TOKEN)  fleet per-host push
+//   GET  /                    (x-monitor-key: MANUAL_TRIGGER_SECRET) dry-run analysis JSON
+//   GET  /?test=1             (x-monitor-key: MANUAL_TRIGGER_SECRET) send a REAL test email
+//
+// plus an internal timer (MONITOR_INTERVAL_MS, default 5 min). Run it behind a
+// TLS reverse proxy (Caddy or Apache): bind loopback here and proxy /ingest.
 
 import http from "node:http";
 import { readFileSync } from "node:fs";
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { WebSocket } from "ws";
 
-import { run, LATEST_KEY } from "./core.js";
-import { probeHandshake, mapHosts, ownedRoomForHost } from "./monitor.js";
+import { run, LATEST_KEY, latestKeyFor } from "./core.js";
+import { probeHandshake, ownedRoomForHost } from "./monitor.js";
 import { fileStore } from "./store.js";
 
 // --- auth helpers ---
@@ -47,7 +49,8 @@ function bearerOk(authHeader, expected) {
 // --- outside-in synthetic probe (real WebSocket handshake) ---
 
 // A fresh 64-hex room per probe, so it never touches a real pairing (and the
-// throwaway room is evicted once idle). Matches the relay's ROOM_NAME_RE.
+// throwaway room is evicted once idle). Matches the relay's ROOM_NAME_RE. Used
+// for the direct-mode probe; fleet mode supplies a specific owned room instead.
 function randomRoom() {
   return randomBytes(32).toString("hex");
 }
@@ -79,13 +82,14 @@ function wsAdapter(ws) {
   };
 }
 
-// Open a WebSocket to the relay's public origin and drive the mac-park handshake
-// the way a client would -- the room rides on the x-relay-room header, which is
-// how the relay reads it (src/index.js ROOM_HEADER). A SINGLE deadline covers
-// both the connect/upgrade and the handshake, because the headline failure this
-// catches -- a stale firewall blackholing inbound -- stalls during connect, so
-// the timeout must abort the connection, not just the handshake. Returns
-// { ok, detail }; never rejects. originUrl is e.g. https://relay.iterm2.com/.
+// Open a WebSocket to a host and drive the mac-park handshake the way a client
+// would -- the room rides on the x-relay-room header (src/index.js ROOM_HEADER).
+// A SINGLE deadline covers both connect/upgrade and handshake, because the
+// headline failure this catches -- a stale firewall blackholing inbound -- stalls
+// during connect, so the timeout must abort the connection, not just the
+// handshake. Returns { ok, detail }; never rejects. `room` defaults to a random
+// throwaway room (direct mode); fleet mode passes a room the target host owns, so
+// a sharded host's correct HTTP 421 reject-on-doubt for foreign rooms is avoided.
 export async function nodeProbe(originUrl, timeoutMs, room = randomRoom()) {
   const wsUrl = originUrl.replace(/^http/i, "ws"); // https->wss, http->ws
   return new Promise((resolve) => {
@@ -113,8 +117,8 @@ export async function nodeProbe(originUrl, timeoutMs, room = randomRoom()) {
     ws.on("open", async () => {
       done(await probeHandshake(wsAdapter(ws)));
     });
-    // A non-101 response (e.g. 502/403 from Caddy or the origin firewall) shows
-    // up here rather than as a socket, and is exactly the broken-inbound signal.
+    // A non-101 response (e.g. 502/403/421 from a proxy or the origin) shows up
+    // here rather than as a socket, and is exactly the broken-inbound signal.
     ws.on("unexpected-response", (_req, res) => {
       done({ ok: false, detail: `no websocket upgrade (HTTP ${res.statusCode})` });
     });
@@ -122,39 +126,20 @@ export async function nodeProbe(originUrl, timeoutMs, room = randomRoom()) {
   });
 }
 
-// Shard-aware fleet probe. With SHARD_MAP_URL set, fetch the live map and drive
-// one owned-room handshake against EVERY host it names, so each host's inbound
-// path is exercised with a room its ownership gate must admit. (A random room
-// against a sharded host earns a correct HTTP 421 reject-on-doubt from every
-// host that does not own that bucket, so on a fleet the old single-URL random
-// probe false-pages against any host owning a small slice.) A host the map
-// assigns nothing is a drained host, a normal state: skipped, not failed. A
-// map that cannot be fetched or parsed IS a probe failure: the map is the
-// pairing-critical resolution step, so if the monitor cannot resolve, clients
-// likely cannot either. Without SHARD_MAP_URL this is the single-URL probe
-// unchanged (direct-mode deployments).
-// probeOne is injectable for tests; prod uses nodeProbe.
-export async function fleetProbe({ probeUrl, shardMapUrl }, timeoutMs, probeOne = nodeProbe) {
-  if (!shardMapUrl) return probeOne(probeUrl, timeoutMs);
-  let map;
-  try {
-    const res = await fetch(shardMapUrl, { cache: "no-store" });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    map = JSON.parse(await res.text());
-  } catch (e) {
-    return { ok: false, detail: `shard map fetch failed: ${String((e && e.message) || e)}` };
-  }
-  const failures = [];
-  const probed = [];
-  for (const host of mapHosts(map)) {
-    const room = ownedRoomForHost(map, host, randomBytes(30).toString("hex"), Math.random());
-    if (!room) continue; // drained host: owns nothing, nothing to probe
-    probed.push(host);
-    const r = await probeOne(`https://${host}/`, timeoutMs, room);
-    if (!r.ok) failures.push(`${host}: ${r.detail}`);
-  }
-  if (failures.length) return { ok: false, detail: failures.join("; ") };
-  return { ok: true, detail: `map v${map.version}: ${probed.length} host(s) ok (${probed.join(", ")})` };
+// --- shard map (fleet mode) ---
+
+// Fetch + parse the live shard map. max-age is a client-correctness invariant on
+// the resolver side; no-store here so the monitor always sees the current map.
+async function fetchMap(url) {
+  const res = await fetch(url, { cache: "no-store" });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return JSON.parse(await res.text());
+}
+
+// Build a 64-hex room the host owns, using this box's randomness (the pure
+// ownedRoomForHost stays deterministic by taking the randomness as arguments).
+function roomForHost(map, host) {
+  return ownedRoomForHost(map, host, randomBytes(30).toString("hex"), Math.random());
 }
 
 // --- email (Resend) ---
@@ -217,6 +202,10 @@ function readBody(req, limitBytes = 64 * 1024) {
   });
 }
 
+// A DNS hostname: labels of letters/digits/hyphens joined by dots, <=253 chars.
+// Bearer-gated already; this just keeps a bogus path from creating junk keys.
+const HOST_RE = /^(?=.{1,253}$)[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$/i;
+
 export function createServer(env, deps) {
   const { kv } = deps;
   return http.createServer(async (req, res) => {
@@ -227,11 +216,18 @@ export function createServer(env, deps) {
       return json(res, { error: "bad url" }, 400);
     }
 
-    // The relay pushes its snapshot here. Bearer-authenticated; the body is the
-    // flat counter/gauge object from Metrics.snapshot().
-    if (req.method === "POST" && url.pathname === "/ingest") {
+    // A relay pushes its aggregate snapshot here. Bearer-authenticated. Bare
+    // /ingest is the single direct-mode relay; /ingest/<host> is a fleet host,
+    // stored under its own key so per-host liveness/analysis stay separate.
+    if (req.method === "POST" && (url.pathname === "/ingest" || url.pathname.startsWith("/ingest/"))) {
       if (!bearerOk(req.headers.authorization, env.INGEST_TOKEN)) {
         return json(res, { error: "unauthorized" }, 401);
+      }
+      let key = LATEST_KEY;
+      if (url.pathname !== "/ingest") {
+        const host = decodeURIComponent(url.pathname.slice("/ingest/".length));
+        if (!HOST_RE.test(host)) return json(res, { error: "bad host" }, 400);
+        key = latestKeyFor(host);
       }
       let snapshot;
       try {
@@ -239,7 +235,7 @@ export function createServer(env, deps) {
       } catch {
         return json(res, { error: "bad json" }, 400);
       }
-      await kv.put(LATEST_KEY, JSON.stringify({ receivedAt: Date.now(), snapshot }));
+      await kv.put(key, JSON.stringify({ receivedAt: Date.now(), snapshot }));
       res.writeHead(204).end();
       return;
     }
@@ -260,7 +256,8 @@ export function createServer(env, deps) {
           return json(res, { emailed: false, error: String((e && e.message) || e) }, 500);
         }
       }
-      // Dry run: analyze the latest snapshot without sending mail or writing state.
+      // Dry run: fetch the map, analyze every host's latest snapshot, and probe
+      // each -- without sending mail or writing state.
       return json(res, await run(env, Date.now(), { ...deps, dry: true }));
     }
 
@@ -288,14 +285,21 @@ function main() {
   const stateDir = env.MONITOR_STATE_DIR || "./data";
   const intervalMs = Number(env.MONITOR_INTERVAL_MS || 5 * 60 * 1000);
 
-  const deps = { kv: fileStore(stateDir), runProbe: fleetProbe, sendEmail: sendResend };
+  const deps = {
+    kv: fileStore(stateDir),
+    sendEmail: sendResend,
+    fetchMap,
+    probeOne: nodeProbe,
+    roomForHost,
+  };
 
   const tick = () => run(env, Date.now(), { ...deps, dry: false })
     .catch((e) => console.error("relay-monitor: tick failed:", (e && e.message) || e));
 
   const server = createServer(env, deps);
   server.listen(port, host, () => {
-    console.error(`relay-monitor: listening on http://${host}:${port} (ingest + operator endpoints)`);
+    const mode = env.SHARD_MAP_URL ? `fleet (map: ${env.SHARD_MAP_URL})` : "direct";
+    console.error(`relay-monitor: listening on http://${host}:${port} (${mode})`);
     console.error(`relay-monitor: analyzing every ${Math.round(intervalMs / 1000)}s; state in ${stateDir}`);
     tick(); // run once at startup so a fresh box surfaces problems immediately
     const timer = setInterval(tick, intervalMs);

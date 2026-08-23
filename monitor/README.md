@@ -17,20 +17,26 @@ zero-retention posture.
 
 ## How it works (push, not scrape)
 
-Data flows **outbound** from the relay, so the relay exposes **no** metrics
-endpoint to the internet and never reveals its origin hostname:
+Data flows **outbound** from each relay, so relays expose **no** metrics endpoint
+to the internet. One monitor watches the whole fleet: each relay pushes to its own
+`/ingest/<host>` sub-path, keyed by host so per-relay analysis stays separate.
 
 ```
-relay  ──POST snapshot + Bearer INGEST_TOKEN──▶  monitor /ingest ──▶ latest.json
+relay1 ──POST + Bearer──▶ /ingest/relay1.iterm2.com ──▶ latest:relay1…json
+relay2 ──POST + Bearer──▶ /ingest/relay2.iterm2.com ──▶ latest:relay2…json
                                                      │
-                     internal timer every 5 min ─────┤
+        internal timer every 5 min ─▶ fetch shard map; for each host:
+                                        diff push → analyze + owned-room probe
                                                      ▼
-                            read state → diff → analyze → Resend email
+                                          consolidated Resend email
 ```
 
-The relay pushes a snapshot every ~1-4 min (`RELAY_METRICS_PUSH_*`, see the
-relay's `SELF-HOSTING.md`). An internal timer analyzes the latest snapshot,
-diffs it against the previous one, and raises alerts.
+The **shard map is the source of truth for which hosts exist.** Each tick the
+monitor fetches it (`SHARD_MAP_URL`) and, for every host it names, checks push
+freshness + gauges/counters and drives an inbound probe. **Adding a relay is zero
+monitor config:** put it in the map and point its push at `/ingest/<host>`; the
+monitor discovers it and starts watching. (Without `SHARD_MAP_URL` it degrades to a
+single direct-mode relay that pushes to bare `/ingest`.)
 
 ## Two layers: push (inside-out) + probe (outside-in)
 
@@ -40,18 +46,20 @@ exercises the inbound path (DNS, TLS, origin firewall, proxy, WS upgrade,
 admission). A relay can be up and pushing while every pairing fails.
 
 So each tick also does an **outside-in synthetic probe**: it opens a real
-WebSocket to the relay's public origin and drives a mac-park pairing handshake,
+WebSocket to each host's public origin and drives a mac-park pairing handshake,
 exactly as a client would. Success means the whole serving path works; failure
-(`probe` alert) means inbound is broken even though the process is up. A fresh
-random room is used each time, so it never touches a real pairing. Set
-`RELAY_PROBE_URL` to enable it (unset = push-only).
+(`<host>|probe` alert) means that host's inbound is broken even though its process
+is up. In fleet mode the probe uses a room the target host **owns** (built from the
+shard map): a sharded relay correctly answers HTTP 421 for rooms outside its slice,
+so a random room would false-page against a host owning a small slice. Every probe
+uses a fresh throwaway room, so it never touches a real pairing.
 
 ## What it alerts on
 
 | Alert | Layer | Condition |
 |---|---|---|
 | **Liveness** (dead-man's-switch) | push | No fresh snapshot within `STALE_MINUTES`. A down/wedged relay stops pushing, so silence is the signal. |
-| **Handshake** (`probe`) | probe | The synthetic mac-park handshake to `RELAY_PROBE_URL` failed - the inbound serving path is broken. |
+| **Handshake** (`<host>\|probe`) | probe | The synthetic mac-park handshake to a host failed - that host's inbound serving path is broken. A map that can't be fetched pages once as `probe`. |
 | **Capacity** | push | Live sockets/rooms cross `CAP_WARN_FRAC` / `CAP_CRIT_FRAC` of the configured caps. |
 | **Error rate** | push | HTTP 500s / requests over the interval exceeds `ERROR_RATIO` (with a volume floor). |
 | **Exceptions** | push | Swallowed process exceptions over the interval reach `EXCEPTION_THRESHOLD`. |
@@ -81,27 +89,32 @@ sudo npm ci --omit=dev
 sudo cp monitor.env.example /etc/iterm2-relay-monitor.env
 sudo $EDITOR /etc/iterm2-relay-monitor.env   # set INGEST_TOKEN, RESEND_API_KEY,
                                              # ALERT_*, MANUAL_TRIGGER_SECRET,
-                                             # RELAY_PROBE_URL, caps
+                                             # SHARD_MAP_URL (fleet) or RELAY_PROBE_URL
+                                             # (single relay), caps
 
 # service
 sudo cp ops/iterm2-relay-monitor.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now iterm2-relay-monitor
 
-# TLS front door for /ingest
+# TLS front door: reverse-proxy /ingest here (one route covers all relays).
 sudo cp ops/Caddyfile.example /etc/caddy/Caddyfile   # edit the hostname, merge into yours
 sudo systemctl reload caddy
 ```
 
-Generate the shared secret with `openssl rand -hex 32`. Then point the relay at
-this box - in the relay's env file:
+Generate the shared secret with `openssl rand -hex 32`. Then point each relay at
+this box - in the relay's env file (host in the path, so the monitor keys it):
 
 ```sh
-RELAY_METRICS_PUSH_URL=https://monitor.yourdomain.com/ingest
+RELAY_METRICS_PUSH_URL=https://monitor.yourdomain.com/ingest/relay1.iterm2.com
 RELAY_METRICS_PUSH_TOKEN=<the same value as INGEST_TOKEN>
 # RELAY_METRICS_PUSH_MS=60000   # optional; a local file has no KV write cap, so
                                 # 60s is fine again (KV had forced 240000).
 ```
+
+**Adding a relay later needs no change here:** put it in the shard map and point
+its push at `.../ingest/<its-host>`. The monitor picks it up from the map on the
+next tick (liveness + probe), and the one `/ingest` proxy route already covers it.
 
 ### Run it without systemd / for local testing
 

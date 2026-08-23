@@ -10,7 +10,7 @@ import {
   normalizeSnapshot, deltas, rollHour, parseConfig, analyze, dueAlerts,
   probeHandshake, probeAlert, shardFetchErrorAlert, mapHosts, ownedRoomForHost,
 } from "../src/monitor.js";
-import { run } from "../src/core.js";
+import { run, DIRECT_HOST } from "../src/core.js";
 
 // A Map-backed stand-in for a KV namespace: get(key, "json") and put(key, str).
 function fakeKV(initial = {}) {
@@ -371,7 +371,7 @@ describe("dueAlerts (cooldown)", () => {
   });
 });
 
-describe("run() — state persistence and probe gating", () => {
+describe("run() — direct mode (no shard map)", () => {
   const NOW = Date.parse("2026-06-15T10:30:00.000Z");
   // A snapshot that trips a capacity alert (100 sockets vs a cap of 10), so the
   // run always has a due alert to (try to) send.
@@ -385,55 +385,118 @@ describe("run() — state persistence and probe gating", () => {
     const sendEmail = async () => { throw new Error("boom"); };
     const res = await run(baseEnv(), NOW, { dry: false, kv, sendEmail });
 
-    expect(res.due).toContain("cap:sockets");
+    expect(res.due).toContain("cap:sockets"); // bare key in direct mode
     const state = JSON.parse(kv.store.get("state"));
-    expect(state.prev).toBeTruthy();                     // baseline advanced despite the failure
+    expect(state.hosts[DIRECT_HOST].prev).toBeTruthy();  // baseline advanced despite the failure
     expect(state.sentAt["cap:sockets"]).toBeUndefined(); // not recorded as sent -> retries next tick
   });
 
   it("advances the cooldown when the email send succeeds", async () => {
     const kv = fakeKV({ latest });
-    const sendEmail = async () => {};
-    await run(baseEnv(), NOW, { dry: false, kv, sendEmail });
+    await run(baseEnv(), NOW, { dry: false, kv, sendEmail: async () => {} });
 
     const state = JSON.parse(kv.store.get("state"));
     expect(state.sentAt["cap:sockets"]).toBe(NOW);
   });
 
-  it("does not run the probe when RELAY_PROBE_URL is empty (opt-in)", async () => {
+  it("does not probe without RELAY_PROBE_URL", async () => {
     const kv = fakeKV({ latest });
-    let probeCalls = 0;
-    const runProbe = async () => { probeCalls += 1; return { ok: true }; };
-    const sendEmail = async () => {};
-    await run({ ...baseEnv(), RELAY_PROBE_URL: "" }, NOW, { dry: false, kv, runProbe, sendEmail });
-
-    expect(probeCalls).toBe(0); // empty probe URL means no handshake attempt
+    let calls = 0;
+    const probeOne = async () => { calls += 1; return { ok: true }; };
+    await run(baseEnv(), NOW, { dry: false, kv, sendEmail: async () => {}, probeOne });
+    expect(calls).toBe(0);
   });
 
-  it("runs the probe and raises a probe alert when the handshake fails", async () => {
+  it("probes the single origin (random room) and raises a bare probe alert on failure", async () => {
     const kv = fakeKV({ latest });
-    const runProbe = async () => ({ ok: false, detail: "no websocket upgrade (HTTP 502)" });
-    const sendEmail = async () => {};
-    const res = await run(
-      { ...baseEnv(), RELAY_PROBE_URL: "https://relay.example/" },
-      NOW, { dry: false, kv, runProbe, sendEmail },
-    );
+    const calls = [];
+    const probeOne = async (url, _t, room) => {
+      calls.push({ url, room });
+      return { ok: false, detail: "no websocket upgrade (HTTP 502)" };
+    };
+    const res = await run({ ...baseEnv(), RELAY_PROBE_URL: "https://relay.example/" }, NOW,
+      { dry: false, kv, sendEmail: async () => {}, probeOne });
 
-    expect(res.probe).toEqual({ ok: false, detail: "no websocket upgrade (HTTP 502)" });
+    expect(calls[0].url).toBe("https://relay.example/");
+    expect(calls[0].room).toBeUndefined(); // no owned room in direct mode; probeOne picks one
     expect(res.due).toContain("probe");
   });
+});
 
-  it("runs the probe when SHARD_MAP_URL is set even with no RELAY_PROBE_URL", async () => {
-    // Distributed fleets probe every map host; the map URL alone opts in.
-    const kv = fakeKV({ latest });
-    let got = null;
-    const runProbe = async (opts) => { got = opts; return { ok: true, detail: "all hosts ok" }; };
-    const sendEmail = async () => {};
-    await run(
-      { ...baseEnv(), RELAY_PROBE_URL: "", SHARD_MAP_URL: "https://resolver.example/shardmap.json" },
-      NOW, { dry: false, kv, runProbe, sendEmail },
-    );
-    expect(got).toEqual({ probeUrl: "", shardMapUrl: "https://resolver.example/shardmap.json" });
+describe("run() — fleet mode (shard map is the source of truth)", () => {
+  const NOW = Date.parse("2026-06-15T10:30:00.000Z");
+  const MAP = {
+    version: 2,
+    ranges: [
+      { low: 0, high: 4095, host: "relay2.iterm2.com" },
+      { low: 4096, high: 65535, host: "relay1.iterm2.com" },
+    ],
+  };
+  const env = () => ({
+    SHARD_MAP_URL: "https://resolver.example/shardmap.json",
+    ALERT_FROM: "f", ALERT_TO: "t", RESEND_API_KEY: "k",
+  });
+  const roomForHost = (map, host) => ownedRoomForHost(map, host, "0".repeat(60), 0);
+  const fresh = () => ({ receivedAt: NOW, snapshot: { http_requests_total: 10, sockets_live: 1 } });
+  const okProbe = async () => ({ ok: true, detail: "mac parked" });
+
+  it("watches every host in the map; a host with no push gets its own liveness alert", async () => {
+    const kv = fakeKV({ "latest:relay1.iterm2.com": fresh() }); // relay2 never pushed
+    const probed = [];
+    const probeOne = async (url, _t, room) => { probed.push({ url, room }); return okProbe(); };
+    const res = await run(env(), NOW,
+      { dry: false, kv, sendEmail: async () => {}, fetchMap: async () => MAP, probeOne, roomForHost });
+
+    expect(res.due).toContain("relay2.iterm2.com|liveness");
+    expect(res.due).not.toContain("relay1.iterm2.com|liveness");
+    // both hosts probed, each with a 64-hex room it owns
+    expect(probed.map((p) => p.url).sort())
+      .toEqual(["https://relay1.iterm2.com/", "https://relay2.iterm2.com/"]);
+    for (const p of probed) expect(p.room).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it("raises a per-host probe alert for the one host whose handshake fails", async () => {
+    const kv = fakeKV({
+      "latest:relay1.iterm2.com": fresh(),
+      "latest:relay2.iterm2.com": fresh(),
+    });
+    const probeOne = async (url) => (url.includes("relay2")
+      ? { ok: false, detail: "no websocket upgrade (HTTP 421)" }
+      : okProbe());
+    const res = await run(env(), NOW,
+      { dry: false, kv, sendEmail: async () => {}, fetchMap: async () => MAP, probeOne, roomForHost });
+
+    expect(res.due).toContain("relay2.iterm2.com|probe");
+    expect(res.due).not.toContain("relay1.iterm2.com|probe");
+  });
+
+  it("treats an unfetchable map as a probe failure and falls back to known hosts for liveness", async () => {
+    const kv = fakeKV({ state: { hosts: { "relay1.iterm2.com": {} }, sentAt: {} } });
+    let probeCalls = 0;
+    const probeOne = async () => { probeCalls += 1; return okProbe(); };
+    const res = await run(env(), NOW, {
+      dry: false, kv, sendEmail: async () => {},
+      fetchMap: async () => { throw new Error("HTTP 503"); }, probeOne, roomForHost,
+    });
+
+    expect(res.due).toContain("probe");                          // fleet-wide map-fetch failure
+    expect(res.due).toContain("relay1.iterm2.com|liveness");     // known host still watched
+    expect(probeCalls).toBe(0);                                  // no map -> can't build owned rooms
+  });
+
+  it("prunes state for a host that dropped out of the map", async () => {
+    const kv = fakeKV({
+      "latest:relay1.iterm2.com": fresh(),
+      "latest:relay2.iterm2.com": fresh(),
+      state: { hosts: { "oldhost.example": { prev: { requests: 5 } } }, sentAt: {} },
+    });
+    await run(env(), NOW,
+      { dry: false, kv, sendEmail: async () => {}, fetchMap: async () => MAP, probeOne: okProbe, roomForHost });
+
+    const state = JSON.parse(kv.store.get("state"));
+    expect(state.hosts["oldhost.example"]).toBeUndefined();   // no longer in the map -> pruned
+    expect(state.hosts["relay1.iterm2.com"]).toBeTruthy();
+    expect(state.hosts["relay2.iterm2.com"]).toBeTruthy();
   });
 });
 

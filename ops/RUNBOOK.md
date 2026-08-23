@@ -114,8 +114,9 @@ Read the status code:
 |------|---------|-----|
 | **500** + journal shows an exception on `/ingest` | monitor bug or a full/unwritable `MONITOR_STATE_DIR` | check `journalctl -u iterm2-relay-monitor`; verify disk space and the StateDirectory perms |
 | **401** | token mismatch: relay's `RELAY_METRICS_PUSH_TOKEN` ≠ monitor's `INGEST_TOKEN` | fix `INGEST_TOKEN` in the monitor's env (or the relay env) and restart the affected side |
-| **404** | wrong URL/path (must end `/ingest`) | fix `RELAY_METRICS_PUSH_URL` |
-| **502 / 000 / could not resolve** | Caddy down, monitor process down, or DNS/egress to `<monitor-host>` | check the monitor's Caddy + `iterm2-relay-monitor` unit; confirm VPS egress reaches the monitor host |
+| **404** | wrong URL/path (fleet: `/ingest/<host>`; direct: bare `/ingest`) | fix `RELAY_METRICS_PUSH_URL` |
+| **400** `bad host` | fleet push path has a malformed host segment | fix the `<host>` in `RELAY_METRICS_PUSH_URL` |
+| **502 / 000 / could not resolve** | reverse proxy down, monitor process down, or DNS/egress to `<monitor-host>` | check the monitor's proxy + `iterm2-relay-monitor` unit; confirm VPS egress reaches the monitor host |
 | **204** | the push actually works | failure is intermittent/network-timing; widen `STALE_MINUTES` |
 
 ### Historical root cause: KV free-tier write cap (resolved by moving off Cloudflare)
