@@ -180,3 +180,48 @@ describe("nodeProbe (real ws handshake)", () => {
     expect(seenRoom).toBe(room);
   });
 });
+
+describe("createServer - /dashboard (fleet health page)", () => {
+  const env = { MANUAL_TRIGGER_SECRET: "opkey" };
+  const auth = "Basic " + Buffer.from("admin:opkey").toString("base64");
+
+  it("401s (with a Basic challenge) when auth is missing or wrong", async () => {
+    const base = await listen(createServer(env, { kv: fileStore(tmpDir()) }));
+    const none = await fetch(`${base}/dashboard`);
+    expect(none.status).toBe(401);
+    expect(none.headers.get("www-authenticate")).toMatch(/Basic/);
+    const wrong = await fetch(`${base}/dashboard`, {
+      headers: { authorization: "Basic " + Buffer.from("admin:nope").toString("base64") },
+    });
+    expect(wrong.status).toBe(401);
+  });
+
+  it("renders the fleet health page from the persisted health doc", async () => {
+    const kv = fileStore(tmpDir());
+    await kv.put("health", JSON.stringify({
+      at: Date.now(), fleet: true, mapError: null, mapVersion: 2,
+      summary: { total: 2, ok: 1, warn: 0, crit: 1 },
+      hosts: [
+        { host: "relay1.iterm2.com", status: "ok", ageMs: 5000, sockets: 3, rooms: 2, buckets: 61440, probeOk: true, reasons: [] },
+        { host: "relay2.iterm2.com", status: "crit", ageMs: null, sockets: null, rooms: null, buckets: 4096, probeOk: false, reasons: ["liveness", "probe"] },
+      ],
+      due: [],
+    }));
+    const base = await listen(createServer(env, { kv }));
+    const res = await fetch(`${base}/dashboard`, { headers: { authorization: auth } });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toMatch(/text\/html/);
+    const html = await res.text();
+    expect(html).toContain("relay1.iterm2.com");
+    expect(html).toContain("relay2.iterm2.com");
+    expect(html).toContain("1/2 healthy");
+    expect(html).toMatch(/CRIT/);
+  });
+
+  it("shows a collecting-data page before the first tick", async () => {
+    const base = await listen(createServer(env, { kv: fileStore(tmpDir()) }));
+    const res = await fetch(`${base}/dashboard`, { headers: { authorization: auth } });
+    expect(res.status).toBe(200);
+    expect(await res.text()).toMatch(/Collecting data/i);
+  });
+});

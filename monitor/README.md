@@ -138,10 +138,27 @@ number means pushes are flowing. Right after first bringing up the relay side,
 wait one push interval for the first snapshot; until then the monitor reports
 "relay not reporting" (expected on a brand-new box).
 
+## Fleet dashboard
+
+A single at-a-glance health page for the whole fleet, served by the monitor at
+**`GET /dashboard`** (HTTP Basic auth; any username, password = `MANUAL_TRIGGER_SECRET`).
+One color-coded card per relay (green ok / amber degraded / red down or
+inbound-failing) with just the essentials - last-seen, live sockets/rooms, owned
+buckets, inbound probe - plus an "X of Y healthy" header. It renders from the last
+tick's snapshot (no re-probing on load) and auto-refreshes every 30s.
+
+Reach it either by adding one reverse-proxy route (e.g. Apache
+`ProxyPass /fleet http://127.0.0.1:8790/dashboard`) or, with no server change, an
+SSH tunnel:
+
+```sh
+ssh -L 8790:127.0.0.1:8790 <monitor-host>    # then open http://localhost:8790/dashboard
+```
+
 ## Test
 
 ```sh
-npm test    # vitest: pure analysis core + the store, HTTP, and ws-probe shell
+npm test    # vitest: pure analysis core + the store, HTTP, ws-probe, and dashboard
 ```
 
 ## Layout

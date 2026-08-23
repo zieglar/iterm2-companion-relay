@@ -25,7 +25,7 @@ import { readFileSync } from "node:fs";
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { WebSocket } from "ws";
 
-import { run, LATEST_KEY, latestKeyFor } from "./core.js";
+import { run, LATEST_KEY, latestKeyFor, HEALTH_KEY } from "./core.js";
 import { probeHandshake, ownedRoomForHost } from "./monitor.js";
 import { fileStore } from "./store.js";
 
@@ -44,6 +44,18 @@ function secretEquals(a, expected) {
 function bearerOk(authHeader, expected) {
   const m = /^Bearer\s+(.+)$/i.exec(authHeader || "");
   return m ? secretEquals(m[1], expected) : false;
+}
+
+// HTTP Basic auth for the browser-facing dashboard: any username, password must
+// equal the operator secret. Gives a native browser login and keeps the secret
+// out of the URL (unlike the header-keyed operator JSON endpoints).
+function basicAuthOk(authHeader, expected) {
+  const m = /^Basic\s+(.+)$/i.exec(authHeader || "");
+  if (!m) return false;
+  let decoded;
+  try { decoded = Buffer.from(m[1], "base64").toString("utf8"); } catch { return false; }
+  const i = decoded.indexOf(":");
+  return secretEquals(i === -1 ? decoded : decoded.slice(i + 1), expected);
 }
 
 // --- outside-in synthetic probe (real WebSocket handshake) ---
@@ -202,6 +214,91 @@ function readBody(req, limitBytes = 64 * 1024) {
   });
 }
 
+// --- fleet dashboard (server-rendered from the persisted HEALTH doc) ---
+
+const N_BUCKETS = 65536; // ring size; buckets -> % of fleet weight
+
+function esc(s) {
+  return String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+}
+
+function ago(ms) {
+  if (ms == null) return "never";
+  const s = Math.round(ms / 1000);
+  if (s < 90) return `${s}s`;
+  const m = Math.round(s / 60);
+  if (m < 90) return `${m}m`;
+  const h = Math.round(m / 60);
+  return h < 48 ? `${h}h` : `${Math.round(h / 24)}d`;
+}
+
+const rank = (s) => (s === "crit" ? 2 : s === "warn" ? 1 : 0);
+
+function row(k, v) {
+  return `<div class=r><span class=k>${esc(k)}</span><span class=v>${esc(v)}</span></div>`;
+}
+
+function cardHtml(h) {
+  const rows = [row("seen", h.ageMs == null ? "never" : `${ago(h.ageMs)} ago`)];
+  if (h.sockets != null) rows.push(row("sockets", h.sockets));
+  if (h.rooms != null) rows.push(row("rooms", h.rooms));
+  if (h.buckets != null) rows.push(row("buckets", `${h.buckets} (${(h.buckets / N_BUCKETS * 100).toFixed(1)}%)`));
+  rows.push(row("inbound", h.probeOk == null ? "-" : (h.probeOk ? "ok" : "FAILING")));
+  const why = h.status !== "ok" && h.reasons && h.reasons.length
+    ? `<div class=why>${esc(h.reasons.join(", "))}</div>` : "";
+  return `<div class="card ${esc(h.status)}"><div class=top><span class=host>${esc(h.host)}</span>`
+    + `<span class="badge ${esc(h.status)}">${esc(h.status.toUpperCase())}</span></div>`
+    + `<div class=rows>${rows.join("")}</div>${why}</div>`;
+}
+
+const DASH_CSS = `
+:root{--bg:#f6f7f9;--fg:#1a1d21;--card:#fff;--muted:#6b7280;--line:#e5e7eb;
+--ok:#16a34a;--warn:#d97706;--crit:#dc2626}
+@media(prefers-color-scheme:dark){:root{--bg:#0f1216;--fg:#e6e8eb;--card:#171b21;--muted:#9aa4b2;--line:#262c34}}
+*{box-sizing:border-box}body{margin:0}
+.wrap{font:15px/1.5 system-ui,sans-serif;color:var(--fg);background:var(--bg);min-height:100vh;padding:24px}
+h1{font-size:18px;margin:0 0 12px}.muted{color:var(--muted)}
+.hdr{border-radius:12px;padding:18px 20px;margin-bottom:16px;color:#fff}
+.hdr.ok{background:var(--ok)}.hdr.warn{background:var(--warn)}.hdr.crit{background:var(--crit)}
+.hdr .big{font-size:26px;font-weight:700}.hdr .sub{font-size:14px;opacity:.95}
+.hdr .meta{font-size:12px;opacity:.85;margin-top:6px}
+.banner{border-radius:10px;padding:10px 14px;margin-bottom:14px;background:var(--crit);color:#fff;font-size:14px}
+.grid{display:grid;gap:12px;grid-template-columns:repeat(auto-fill,minmax(230px,1fr))}
+.card{background:var(--card);border:1px solid var(--line);border-left:5px solid var(--muted);border-radius:10px;padding:14px}
+.card.ok{border-left-color:var(--ok)}.card.warn{border-left-color:var(--warn)}.card.crit{border-left-color:var(--crit)}
+.top{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px}
+.host{font-weight:600;word-break:break-all}
+.badge{font-size:11px;font-weight:700;padding:2px 8px;border-radius:999px;color:#fff;white-space:nowrap}
+.badge.ok{background:var(--ok)}.badge.warn{background:var(--warn)}.badge.crit{background:var(--crit)}
+.rows{display:grid;gap:2px}.r{display:flex;justify-content:space-between;font-size:13px}
+.k{color:var(--muted)}.v{font-variant-numeric:tabular-nums}
+.why{margin-top:8px;font-size:12px;color:var(--crit);word-break:break-word}
+`;
+
+function renderDashboard(health, now) {
+  const head = (title, refresh) =>
+    `<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">`
+    + `<meta http-equiv=refresh content=${refresh}><title>${esc(title)}</title><style>${DASH_CSS}</style>`;
+  if (!health) {
+    return `${head("Relay fleet", 15)}<div class=wrap><h1>iTerm2 relay fleet</h1>`
+      + `<p class=muted>Collecting data. The first check runs within the analysis interval; reload shortly.</p></div>`;
+  }
+  const s = health.summary;
+  const overall = s.crit ? "crit" : (s.warn ? "warn" : "ok");
+  const sub = s.crit || s.warn
+    ? `${s.crit ? `${s.crit} critical` : ""}${s.crit && s.warn ? ", " : ""}${s.warn ? `${s.warn} warning` : ""}`
+    : "all systems normal";
+  const cards = health.hosts.slice()
+    .sort((a, b) => rank(b.status) - rank(a.status) || a.host.localeCompare(b.host))
+    .map(cardHtml).join("");
+  const mapLine = health.fleet ? `map v${esc(health.mapVersion ?? "?")}` : "direct mode";
+  const banner = health.mapError ? `<div class=banner>shard map fetch failed: ${esc(health.mapError)}</div>` : "";
+  return `${head(`Relay fleet ${s.crit ? "⚠" : ""}`.trim(), 30)}<div class=wrap>`
+    + `<header class="hdr ${overall}"><div class=big>${s.ok}/${s.total} healthy</div>`
+    + `<div class=sub>${esc(sub)}</div><div class=meta>${mapLine} &middot; updated ${ago(now - health.at)} ago</div></header>`
+    + `${banner}<div class=grid>${cards}</div></div>`;
+}
+
 // A DNS hostname: labels of letters/digits/hyphens joined by dots, <=253 chars.
 // Bearer-gated already; this just keeps a bogus path from creating junk keys.
 const HOST_RE = /^(?=.{1,253}$)[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$/i;
@@ -237,6 +334,24 @@ export function createServer(env, deps) {
       }
       await kv.put(key, JSON.stringify({ receivedAt: Date.now(), snapshot }));
       res.writeHead(204).end();
+      return;
+    }
+
+    // Fleet dashboard: a browser-facing at-a-glance health page, Basic-auth
+    // gated, rendered from the last tick's persisted HEALTH doc (no re-probing
+    // on load). Auto-refreshes client-side.
+    if (req.method === "GET" && url.pathname === "/dashboard") {
+      if (!basicAuthOk(req.headers.authorization, env.MANUAL_TRIGGER_SECRET)) {
+        res.writeHead(401, {
+          "WWW-Authenticate": 'Basic realm="relay-fleet", charset="UTF-8"',
+          "content-type": "text/plain",
+        });
+        res.end("authentication required");
+        return;
+      }
+      const health = await kv.get(HEALTH_KEY, "json");
+      res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
+      res.end(renderDashboard(health, Date.now()));
       return;
     }
 

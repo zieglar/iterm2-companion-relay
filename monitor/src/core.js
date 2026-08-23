@@ -16,6 +16,9 @@
 // SHARD_MAP_URL this degrades to a single direct-mode relay (one push key + an
 // optional random-room probe via RELAY_PROBE_URL), so a non-sharded self-host still
 // works. The pure analysis lives in monitor.js; this file wires it to state + I/O.
+//
+// Each non-dry tick also persists a compact per-host HEALTH doc (status ok/warn/
+// crit + a few gauges) that the fleet dashboard renders without re-probing on load.
 
 import {
   parseConfig, normalizeSnapshot, deltas, rollHour, hourKey, analyze, dueAlerts,
@@ -26,6 +29,7 @@ import {
 // land under `latest:<host>`.
 export const LATEST_KEY = "latest";
 export const STATE_KEY = "state";
+export const HEALTH_KEY = "health";
 export const DIRECT_HOST = "__direct__";
 
 export function latestKeyFor(host) {
@@ -44,8 +48,20 @@ function hostOf(url) {
   try { return new URL(url).host; } catch { return "relay"; }
 }
 
+// Total buckets a host owns in the map (for the dashboard's shard-weight readout).
+function ownedBucketCount(map, host) {
+  let n = 0;
+  for (const r of (map && map.ranges) || []) {
+    if (r && r.host === host && Number.isInteger(r.low) && Number.isInteger(r.high) && r.low <= r.high) {
+      n += r.high - r.low + 1;
+    }
+  }
+  return n;
+}
+
 // env: the flat config/secrets object (process.env in prod). now: ms timestamp.
-// deps: { dry, kv, sendEmail, fetchMap, probeOne, roomForHost }.
+// deps: { dry, kv, sendEmail, fetchMap, probeOne, roomForHost }. Returns the health
+// doc (also persisted when !dry).
 export async function run(env, now, { dry, kv, sendEmail, fetchMap, probeOne, roomForHost }) {
   const cfg = parseConfig(env);
   const state = dry ? {} : ((await kv.get(STATE_KEY, "json")) || {});
@@ -84,44 +100,70 @@ export async function run(env, now, { dry, kv, sendEmail, fetchMap, probeOne, ro
     const latest = await kv.get(latestKeyFor(host), "json");
     const ageMs = latest ? now - latest.receivedAt : null;
     const hs = (state.hosts && state.hosts[host]) || {};
+    const reasons = [];        // this host's own alert keys (bare), for the dashboard
+    let sockets = null;
+    let rooms = null;
 
     // --- push side: liveness + the pushed-metric checks ---
     if (!latest || ageMs > cfg.staleMs) {
       const detail = latest ? `no snapshot for ${Math.round(ageMs / 60000)} min` : "no snapshot received yet";
-      alerts.push(hostAlert(host, fleet, livenessAlert(detail)));
+      const a = livenessAlert(detail);
+      reasons.push(a.key);
+      alerts.push(hostAlert(host, fleet, a));
       nextHosts[host] = hs; // preserve baselines so they resume when pushes return
     } else {
       const snap = normalizeSnapshot(latest.snapshot);
+      sockets = snap.gauges.socketsLive;
+      rooms = snap.gauges.roomsLive;
       const interval = deltas(hs.prev, snap.counters);
       const roll = rollHour(hs.hourAnchor, snap.counters, hourKey(now));
       const analyzed = analyze({ gauges: snap.gauges, interval, lastHour: roll.lastHour }, hs, cfg);
-      for (const a of analyzed.alerts) alerts.push(hostAlert(host, fleet, a));
+      for (const a of analyzed.alerts) { reasons.push(a.key); alerts.push(hostAlert(host, fleet, a)); }
       nextHosts[host] = {
         prev: snap.counters, hourAnchor: roll.anchor,
         history: analyzed.history, lastRecordedHour: analyzed.lastRecordedHour,
       };
     }
 
-    // --- inbound side: an owned-room handshake per host ---
+    // --- inbound side: a real pairing handshake ---
     let probe = null;
     if (fleet && map && probeOne && roomForHost) {
-      const room = roomForHost(map, host);
-      if (room) { // null => host owns nothing (drained): nothing to probe
-        probe = await probeOne(`https://${host}/`, cfg.probeTimeoutMs, room);
-        if (!probe.ok) alerts.push(hostAlert(host, fleet, probeAlert(probe.detail)));
-      }
+      const room = roomForHost(map, host); // null => host owns nothing (drained): skip
+      if (room) probe = await probeOne(`https://${host}/`, cfg.probeTimeoutMs, room);
+    } else if (!fleet && env.RELAY_PROBE_URL && probeOne) {
+      probe = await probeOne(env.RELAY_PROBE_URL, cfg.probeTimeoutMs); // direct mode: random room
     }
-    summaries.push({ host: fleet ? host : hostOf(env.RELAY_PROBE_URL || ""), ageMs, probe });
-  }
+    if (probe && !probe.ok) { reasons.push("probe"); alerts.push(hostAlert(host, fleet, probeAlert(probe.detail))); }
 
-  // Direct-mode probe: a single random-room handshake (no map to build an owned room).
-  if (!fleet && env.RELAY_PROBE_URL && probeOne) {
-    const probe = await probeOne(env.RELAY_PROBE_URL, cfg.probeTimeoutMs);
-    if (!probe.ok) alerts.push(probeAlert(probe.detail));
-    if (summaries[0]) summaries[0].probe = probe;
+    // Per-host status for the dashboard: liveness (not reporting) or a failed
+    // probe (can't pair) is critical; any other alert (capacity/errors/
+    // exceptions/shard/anomaly) is a warning; otherwise ok.
+    const crit = !latest || (ageMs != null && ageMs > cfg.staleMs) || (probe ? !probe.ok : false);
+    const warn = !crit && reasons.some((k) => k !== "liveness" && k !== "probe");
+    summaries.push({
+      host: fleet ? host : (hostOf(env.RELAY_PROBE_URL || "") || "relay"),
+      status: crit ? "crit" : (warn ? "warn" : "ok"),
+      ageMs,
+      sockets,
+      rooms,
+      buckets: (fleet && map) ? ownedBucketCount(map, host) : null,
+      probeOk: probe ? probe.ok : null,
+      reasons,
+    });
   }
 
   const { due, sentAt } = dueAlerts(alerts, state.sentAt || {}, now, cfg.cooldownMs);
+
+  const counts = summaries.reduce((c, s) => { c[s.status] += 1; return c; }, { ok: 0, warn: 0, crit: 0 });
+  const health = {
+    at: now,
+    fleet,
+    mapError,
+    mapVersion: map ? (map.version ?? null) : null,
+    summary: { total: summaries.length, ...counts },
+    hosts: summaries,
+    due: due.map((a) => a.key),
+  };
 
   const nextState = { hosts: nextHosts };
   if (!dry) {
@@ -141,8 +183,9 @@ export async function run(env, now, { dry, kv, sendEmail, fetchMap, probeOne, ro
     // is due again next tick instead of being silently recorded as sent.
     nextState.sentAt = delivered ? sentAt : (state.sentAt || {});
     await kv.put(STATE_KEY, JSON.stringify(nextState));
+    await kv.put(HEALTH_KEY, JSON.stringify(health)); // snapshot for the fleet dashboard
   }
-  return { fleet, mapError, hosts: summaries, alerts, due: due.map((a) => a.key) };
+  return health;
 }
 
 // Local copy of the map->hosts projection so core doesn't depend on server; the

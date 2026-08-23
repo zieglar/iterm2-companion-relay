@@ -498,6 +498,38 @@ describe("run() — fleet mode (shard map is the source of truth)", () => {
     expect(state.hosts["relay1.iterm2.com"]).toBeTruthy();
     expect(state.hosts["relay2.iterm2.com"]).toBeTruthy();
   });
+
+  it("persists a per-host health doc: healthy -> ok, elevated -> warn", async () => {
+    const kv = fakeKV({
+      "latest:relay1.iterm2.com": { receivedAt: NOW, snapshot: { sockets_live: 1 } },   // healthy
+      "latest:relay2.iterm2.com": { receivedAt: NOW, snapshot: { sockets_live: 8 } },   // 8/10 -> capacity warn
+    });
+    await run({ ...env(), SOCKETS_CAP: "10" }, NOW,
+      { dry: false, kv, sendEmail: async () => {}, fetchMap: async () => MAP, probeOne: okProbe, roomForHost });
+
+    const health = JSON.parse(kv.store.get("health"));
+    const byHost = Object.fromEntries(health.hosts.map((h) => [h.host, h]));
+    expect(byHost["relay1.iterm2.com"].status).toBe("ok");
+    expect(byHost["relay1.iterm2.com"].sockets).toBe(1);
+    expect(byHost["relay1.iterm2.com"].buckets).toBeGreaterThan(0);
+    expect(byHost["relay2.iterm2.com"].status).toBe("warn");
+    expect(byHost["relay2.iterm2.com"].reasons).toContain("cap:sockets");
+    expect(health.summary).toMatchObject({ total: 2, ok: 1, warn: 1, crit: 0 });
+    expect(health.mapVersion).toBe(2);
+  });
+
+  it("marks a non-reporting host and a failing-probe host as crit", async () => {
+    const kv = fakeKV({ "latest:relay1.iterm2.com": { receivedAt: NOW, snapshot: { sockets_live: 1 } } });
+    const probeOne = async (url) => (url.includes("relay1") ? { ok: false, detail: "HTTP 502" } : { ok: true });
+    await run(env(), NOW,
+      { dry: false, kv, sendEmail: async () => {}, fetchMap: async () => MAP, probeOne, roomForHost });
+
+    const health = JSON.parse(kv.store.get("health"));
+    const byHost = Object.fromEntries(health.hosts.map((h) => [h.host, h]));
+    expect(byHost["relay2.iterm2.com"].status).toBe("crit"); // never reported (liveness)
+    expect(byHost["relay1.iterm2.com"].status).toBe("crit"); // inbound probe failing
+    expect(health.summary.crit).toBe(2);
+  });
 });
 
 describe("shard-aware probe helpers", () => {
