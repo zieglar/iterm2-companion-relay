@@ -60,6 +60,19 @@ this.
    journalctl -u iterm2-companion-relay | grep "mode=distributed"
    ```
 
+5. **Onboard it to the monitor** (`monitor/README.md`). The monitor's probe
+   auto-discovers the new host from the shard map (zero config), but per-host
+   liveness/capacity needs the box to push its metrics. In `ops/deploy.env` set:
+
+   ```sh
+   RELAY_METRICS_PUSH_URL=https://<monitor-host>/ingest/<this-box-host>
+   RELAY_METRICS_PUSH_TOKEN=<shared secret; matches the monitor's INGEST_TOKEN>
+   ```
+
+   Use the box's own map `host` string in the path, so the monitor keys its
+   snapshot under that host. Without this the box probes green but never reports,
+   and the monitor pages `<host>|liveness`.
+
 Boot is fetch-before-accept: the relay refuses to serve until it has a map,
 retrying for about a minute and then exiting (systemd restarts it). So a
 deploy performed while the resolver is unreachable crash-loops rather than
@@ -96,6 +109,11 @@ Reshard converges in roughly `drain delay + moved-rooms / eviction rate`
 seconds. It is deliberately unhurried; the pacing is what protects the gaining
 hosts from a handshake storm. Do not raise `RELAY_EVICTION_RATE` beyond what a
 target host comfortably absorbs in TLS handshakes per second.
+
+No monitor change is needed for a reshard: the probe re-reads the map each tick
+(auto-covering any newly-added host), and every host keeps pushing under its own
+key. Onboarding a brand-new box is the only time you touch the monitor, via the
+push line in *Deploy a distributed-mode box* above.
 
 ## Take a box down gracefully (drain to empty, then retire)
 
