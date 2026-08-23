@@ -3,14 +3,14 @@
 // diffing of the pushed counter snapshots and the cooldown that keeps a sustained
 // condition from re-paging every run. No I/O here.
 
-import { describe, it, expect, vi, afterEach } from "vitest";
+import { describe, it, expect } from "vitest";
 import {
   median, pushSample, hourKey, hourOfWeek,
   capAlerts, errorAlert, exceptionAlert, livenessAlert, anomalyAlert,
   normalizeSnapshot, deltas, rollHour, parseConfig, analyze, dueAlerts,
-  probeHandshake, probeAlert, shardFetchErrorAlert,
+  probeHandshake, probeAlert, shardFetchErrorAlert, mapHosts, ownedRoomForHost,
 } from "../src/monitor.js";
-import { run } from "../src/worker.js";
+import { run } from "../src/core.js";
 
 // A Map-backed stand-in for a KV namespace: get(key, "json") and put(key, str).
 function fakeKV(initial = {}) {
@@ -376,17 +376,14 @@ describe("run() — state persistence and probe gating", () => {
   // A snapshot that trips a capacity alert (100 sockets vs a cap of 10), so the
   // run always has a due alert to (try to) send.
   const latest = { receivedAt: NOW, snapshot: { http_requests_total: 1000, sockets_live: 100 } };
-  const baseEnv = (kv) => ({
-    MONITOR_KV: kv, SOCKETS_CAP: "10",
-    ALERT_FROM: "from", ALERT_TO: "to", RESEND_API_KEY: "key",
+  const baseEnv = () => ({
+    SOCKETS_CAP: "10", ALERT_FROM: "from", ALERT_TO: "to", RESEND_API_KEY: "key",
   });
-
-  afterEach(() => vi.unstubAllGlobals());
 
   it("advances the baselines but NOT the cooldown when the email send fails", async () => {
     const kv = fakeKV({ latest });
-    vi.stubGlobal("fetch", async () => ({ ok: false, status: 500, text: async () => "boom" }));
-    const res = await run(baseEnv(kv), NOW, { dry: false });
+    const sendEmail = async () => { throw new Error("boom"); };
+    const res = await run(baseEnv(), NOW, { dry: false, kv, sendEmail });
 
     expect(res.due).toContain("cap:sockets");
     const state = JSON.parse(kv.store.get("state"));
@@ -396,8 +393,8 @@ describe("run() — state persistence and probe gating", () => {
 
   it("advances the cooldown when the email send succeeds", async () => {
     const kv = fakeKV({ latest });
-    vi.stubGlobal("fetch", async () => ({ ok: true, status: 200 }));
-    await run(baseEnv(kv), NOW, { dry: false });
+    const sendEmail = async () => {};
+    await run(baseEnv(), NOW, { dry: false, kv, sendEmail });
 
     const state = JSON.parse(kv.store.get("state"));
     expect(state.sentAt["cap:sockets"]).toBe(NOW);
@@ -405,11 +402,88 @@ describe("run() — state persistence and probe gating", () => {
 
   it("does not run the probe when RELAY_PROBE_URL is empty (opt-in)", async () => {
     const kv = fakeKV({ latest });
-    let fetchCalls = 0;
-    vi.stubGlobal("fetch", async () => { fetchCalls += 1; return { ok: true, status: 200 }; });
-    await run({ ...baseEnv(kv), RELAY_PROBE_URL: "" }, NOW, { dry: false });
+    let probeCalls = 0;
+    const runProbe = async () => { probeCalls += 1; return { ok: true }; };
+    const sendEmail = async () => {};
+    await run({ ...baseEnv(), RELAY_PROBE_URL: "" }, NOW, { dry: false, kv, runProbe, sendEmail });
 
-    // Only the email send hits fetch; an empty probe URL means no handshake attempt.
-    expect(fetchCalls).toBe(1);
+    expect(probeCalls).toBe(0); // empty probe URL means no handshake attempt
+  });
+
+  it("runs the probe and raises a probe alert when the handshake fails", async () => {
+    const kv = fakeKV({ latest });
+    const runProbe = async () => ({ ok: false, detail: "no websocket upgrade (HTTP 502)" });
+    const sendEmail = async () => {};
+    const res = await run(
+      { ...baseEnv(), RELAY_PROBE_URL: "https://relay.example/" },
+      NOW, { dry: false, kv, runProbe, sendEmail },
+    );
+
+    expect(res.probe).toEqual({ ok: false, detail: "no websocket upgrade (HTTP 502)" });
+    expect(res.due).toContain("probe");
+  });
+
+  it("runs the probe when SHARD_MAP_URL is set even with no RELAY_PROBE_URL", async () => {
+    // Distributed fleets probe every map host; the map URL alone opts in.
+    const kv = fakeKV({ latest });
+    let got = null;
+    const runProbe = async (opts) => { got = opts; return { ok: true, detail: "all hosts ok" }; };
+    const sendEmail = async () => {};
+    await run(
+      { ...baseEnv(), RELAY_PROBE_URL: "", SHARD_MAP_URL: "https://resolver.example/shardmap.json" },
+      NOW, { dry: false, kv, runProbe, sendEmail },
+    );
+    expect(got).toEqual({ probeUrl: "", shardMapUrl: "https://resolver.example/shardmap.json" });
+  });
+});
+
+describe("shard-aware probe helpers", () => {
+  const MAP = {
+    version: 2,
+    ranges: [
+      { low: 0, high: 4095, host: "relay2.iterm2.com" },
+      { low: 4096, high: 65535, host: "relay1.iterm2.com" },
+    ],
+  };
+  const PREFIX = "0".repeat(60);
+
+  describe("mapHosts", () => {
+    it("returns unique hosts in first-appearance order", () => {
+      const map = { ranges: [
+        { low: 0, high: 1, host: "b" }, { low: 2, high: 3, host: "a" }, { low: 4, high: 5, host: "b" },
+      ]};
+      expect(mapHosts(map)).toEqual(["b", "a"]);
+    });
+    it("is empty for a missing or empty map", () => {
+      expect(mapHosts(null)).toEqual([]);
+      expect(mapHosts({})).toEqual([]);
+    });
+  });
+
+  describe("ownedRoomForHost", () => {
+    it("builds a 64-hex room whose bucket the host owns", () => {
+      const room = ownedRoomForHost(MAP, "relay2.iterm2.com", PREFIX, 0.5);
+      expect(room).toMatch(/^[0-9a-f]{64}$/);
+      const bucket = parseInt(room.slice(-4), 16);
+      expect(bucket).toBeGreaterThanOrEqual(0);
+      expect(bucket).toBeLessThanOrEqual(4095);
+    });
+    it("spans the host's full range as randUnit sweeps 0..1", () => {
+      expect(ownedRoomForHost(MAP, "relay1.iterm2.com", PREFIX, 0).slice(-4)).toBe("1000");   // 4096
+      expect(ownedRoomForHost(MAP, "relay1.iterm2.com", PREFIX, 0.999999).slice(-4)).toBe("ffff");
+    });
+    it("walks disjoint arcs owned by the same host", () => {
+      const map = { ranges: [
+        { low: 0, high: 0, host: "h" },
+        { low: 10, high: 10, host: "other" },
+        { low: 65535, high: 65535, host: "h" },
+      ]};
+      expect(ownedRoomForHost(map, "h", PREFIX, 0).slice(-4)).toBe("0000");
+      expect(ownedRoomForHost(map, "h", PREFIX, 0.75).slice(-4)).toBe("ffff");
+    });
+    it("returns null for a host that owns nothing (drained) or is absent", () => {
+      expect(ownedRoomForHost(MAP, "relay3.iterm2.com", PREFIX, 0)).toBe(null);
+      expect(ownedRoomForHost({ ranges: [] }, "h", PREFIX, 0)).toBe(null);
+    });
   });
 });

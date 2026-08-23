@@ -4,10 +4,10 @@
 // KV, and sends whatever alerts come back. Kept pure so the alerting logic is
 // unit-tested deterministically.
 //
-// The relay is self-hosted (a Node process behind Cloudflare), not a Worker, so
-// there is no Cloudflare Workers Analytics to query. Instead the relay posts a
-// snapshot of its own counters/gauges to the monitor; this module turns a series
-// of those snapshots into alerts:
+// The relay is self-hosted and exposes /metrics only on loopback, so there is
+// nothing to scrape from off-box. Instead the relay posts a snapshot of its own
+// counters/gauges to the monitor; this module turns a series of those snapshots
+// into alerts:
 //   - liveness: the collector saw no fresh snapshot within the staleness window
 //   - capacity: live sockets/rooms approaching the relay's configured caps
 //   - error rate: HTTP 500s as a fraction of requests over the interval
@@ -107,6 +107,44 @@ export function shardFetchErrorAlert({ count, threshold }) {
       `The relay keeps serving its last-known-good map; if this persists across a reshard, ` +
       `hard-stop the host to complete the drain.`,
   };
+}
+
+// --- shard-aware probe support (distributed fleets) ---
+// Against a sharded fleet a random-room probe is wrong: a host that owns a
+// small slice of the ring answers HTTP 421 (reject-on-doubt) for almost every
+// random room, which is CORRECT relay behavior, not a broken inbound path. So
+// the probe must ask each host about a room it actually owns. The bucket is the
+// room name's last two bytes (big-endian), so an owned room can be constructed
+// directly: 60 random hex chars + the 4-hex bucket.
+
+// mapHosts(map) -> unique host strings in first-appearance order.
+export function mapHosts(map) {
+  const hosts = [];
+  for (const r of (map && map.ranges) || []) {
+    if (r && typeof r.host === "string" && !hosts.includes(r.host)) hosts.push(r.host);
+  }
+  return hosts;
+}
+
+// ownedRoomForHost(map, host, prefix60, randUnit) -> a 64-hex room whose bucket
+// the host owns, or null if the map assigns it nothing (a drained host; skip it,
+// that is a normal state). prefix60 is 60 caller-supplied lowercase hex chars
+// (the caller owns randomness so this stays pure); randUnit in [0,1) picks
+// uniformly across every bucket the host owns, so repeated probes exercise the
+// whole owned set, disjoint arcs included.
+export function ownedRoomForHost(map, host, prefix60, randUnit = 0) {
+  if (!/^[0-9a-f]{60}$/.test(prefix60)) throw new Error("prefix60 must be 60 lowercase hex chars");
+  const ranges = ((map && map.ranges) || []).filter((r) => r && r.host === host
+    && Number.isInteger(r.low) && Number.isInteger(r.high) && r.low <= r.high);
+  const total = ranges.reduce((n, r) => n + (r.high - r.low + 1), 0);
+  if (total === 0) return null;
+  let idx = Math.min(total - 1, Math.max(0, Math.floor(randUnit * total)));
+  for (const r of ranges) {
+    const size = r.high - r.low + 1;
+    if (idx < size) return prefix60 + (r.low + idx).toString(16).padStart(4, "0");
+    idx -= size;
+  }
+  return null; // unreachable: idx < total by construction
 }
 
 // Liveness: the collector has no fresh snapshot. This is the dead-man's-switch —

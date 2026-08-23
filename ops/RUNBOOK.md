@@ -4,35 +4,34 @@ What to do when the relay monitor emails you, and the facts you need to triage
 fast. Covers the alert classes the monitor (`monitor/`) can send and the
 diagnostics that actually distinguish them.
 
-> ⚠️ **Redacted for a public repo.** Identifying values — the relay's public
-> origin, the monitor's `workers.dev` URL, the KV namespace id, the alert email —
-> are placeholders (`<relay-origin>`, `<monitor-url>`, `<kv-id>`, `<alert-email>`).
-> Substitute your own. Your live copy of `monitor/wrangler.jsonc` holds the real
-> ones and is `skip-worktree` so they never get committed (see
-> [Config lives locally](#config-lives-locally)).
+> ⚠️ **Redacted for a public repo.** Identifying values (the relay's public
+> origin, the monitor's public hostname, the alert email) are placeholders
+> (`<relay-origin>`, `<monitor-host>`, `<alert-email>`). Substitute your own. The
+> real values live in the monitor box's `monitor.env` (gitignored), never in the
+> repo (see [Config lives locally](#config-lives-locally)).
 
 ---
 
 ## Architecture in one picture
 
 ```
-  relay (Node, VPS) ──outbound push every 4 min──▶ monitor Worker /ingest ──▶ KV "latest"
-   │  bin/relay.js                                  (Cloudflare, free plan)      │
-   │  host/metricspush.js                                                        │
-   │                                    cron */5 ──▶ reads "latest", analyzes ───┘
-   │                                                 emails on liveness/cap/errors/
-   │                                                 exceptions/anomaly
+  relay (Node, VPS) ──outbound push every ~1 min──▶ monitor /ingest ──▶ latest.json
+   │  bin/relay.js                                   (Node, separate box)     │
+   │  host/metricspush.js                                                     │
+   │                              internal timer */5 ──▶ reads state, analyzes ┘
+   │                                                     emails on liveness/cap/errors/
+   │                                                     exceptions/anomaly
    │
    └──loopback /metrics (127.0.0.1:8788)──▶ on-box dashboard (independent path)
 ```
 
 Two things to internalize:
 
-- **The relay is self-hosted** (a Node process behind Cloudflare), **not** the
-  old Cloudflare Worker. The monitor watches the VPS relay via *pushed* metrics.
-  An older Analytics-based monitor used to live in the `iterm2` repo under
-  `Companion/RelayMonitor/`; it has been deleted — see [History: the old
-  monitor](#history-the-old-monitor).
+- **The monitor is a self-hosted Node service on a separate box** (ideally a
+  different hosting provider from the relays), not a Cloudflare Worker. It moved
+  off Cloudflare because the per-push KV write cost blew the free-tier daily quota
+  every afternoon (see [History: off Cloudflare](#history-off-cloudflare)). It
+  watches the VPS relay via *pushed* metrics.
 - **The push path and the dashboard path are independent.** The dashboard scrapes
   the relay's loopback `/metrics` locally, so it keeps working even when the
   outbound push to the monitor is failing. That split is a diagnostic lever
@@ -78,7 +77,7 @@ curl -s http://127.0.0.1:8788/metrics | grep -E \
   `relay_process_exceptions_total` history in the dashboard.
 
 **3. Are the outbound pushes failing?** Watch the push-error counter for ~2 min
-(pushes happen every 4 min; the counter should be flat):
+(pushes happen every ~1 min; the counter should be flat):
 
 ```bash
 for i in 1 2 3; do curl -s http://127.0.0.1:8788/metrics \
@@ -90,11 +89,12 @@ relay only *counts* failures (`host/server.js`: `onError: () =>
 metrics.inc("metrics_push_errors_total")`) — it never logs the reason (logless
 posture), so the reason must come from the monitor side (step 4).
 
-**4. Why are pushes failing? Ask the monitor.** Observability is ON for the
-monitor Worker, so tail it and reproduce:
+**4. Why are pushes failing? Ask the monitor.** The monitor logs its own
+operation to the journal (it handles no user traffic and stores no PII, so this
+is safe). On the monitor box:
 
 ```bash
-cd monitor && wrangler tail iterm2-relay-monitor      # then trigger one push (below)
+journalctl -u iterm2-relay-monitor -f        # then trigger one push (below)
 ```
 
 Then reproduce a single push from the VPS with the real URL + token (needs root
@@ -112,67 +112,33 @@ Read the status code:
 
 | Code | Meaning | Fix |
 |------|---------|-----|
-| **500** + tail shows `KV put() limit exceeded for the day` | **KV free-tier write cap hit** (the incident below) | slow the push cadence — see fix |
-| **500** + tail shows `Cannot read properties of undefined` | `MONITOR_KV` binding missing/broken | fix the KV binding id in `wrangler.jsonc`, redeploy |
-| **401** | token mismatch: relay's `RELAY_METRICS_PUSH_TOKEN` ≠ monitor's `INGEST_TOKEN` secret | re-`wrangler secret put INGEST_TOKEN` or fix the relay env |
-| **404** | wrong URL/path (must end `/ingest`) or wrong worker | fix `RELAY_METRICS_PUSH_URL` |
-| **000 / could not resolve** | DNS/egress to the monitor host | check the `<subdomain>` in the URL; confirm VPS egress to `workers.dev` |
+| **500** + journal shows an exception on `/ingest` | monitor bug or a full/unwritable `MONITOR_STATE_DIR` | check `journalctl -u iterm2-relay-monitor`; verify disk space and the StateDirectory perms |
+| **401** | token mismatch: relay's `RELAY_METRICS_PUSH_TOKEN` ≠ monitor's `INGEST_TOKEN` | fix `INGEST_TOKEN` in the monitor's env (or the relay env) and restart the affected side |
+| **404** | wrong URL/path (must end `/ingest`) | fix `RELAY_METRICS_PUSH_URL` |
+| **502 / 000 / could not resolve** | Caddy down, monitor process down, or DNS/egress to `<monitor-host>` | check the monitor's Caddy + `iterm2-relay-monitor` unit; confirm VPS egress reaches the monitor host |
 | **204** | the push actually works | failure is intermittent/network-timing; widen `STALE_MINUTES` |
 
-### Known root cause #1 — KV free-tier write cap (the July 2026 incident)
+### Historical root cause: KV free-tier write cap (resolved by moving off Cloudflare)
 
-**Symptom:** one `Relay not reporting` email, arriving the same time each day;
-relay healthy and serving throughout; `wrangler tail` shows
-`Error: KV put() limit exceeded for the day` on `POST /ingest`.
+> **This can no longer happen.** The monitor used to be a Cloudflare Worker that
+> wrote each push into KV, and the free plan caps KV at **1000 writes/day,
+> account-wide**. One write per ~1-min push (1440/day) plus the cron's state
+> write blew the cap every afternoon: every `/ingest` PUT then threw 500, the
+> stored snapshot went stale, and the dead-man's-switch paged at the same time
+> each day, resetting at 00:00 UTC. That recurring self-inflicted spam is why the
+> monitor moved to a Node service backed by a local file, which has no write cap.
+> If you see this pattern, you're running the old Worker; finish the migration.
 
-**Cause:** the Workers **free plan caps KV at 1000 writes/day, account-wide**
-(shared with every other Worker/KV on the account). The monitor writes one KV
-entry per push. At the old 60 s cadence that's **1440 writes/day** from pushes
-alone, plus ~288/day from the `*/5` cron's state write ≈ **1728/day** — well over
-the cap. Each day's quota is spent mid-day; from then on every `/ingest` PUT
-throws 500, the stored snapshot stops advancing, it goes stale, and the
-dead-man's-switch pages. Quota resets at **00:00 UTC**, so it "recovers" every
-night and re-breaks every day.
+**Still-relevant tuning:** `STALE_MINUTES` **must exceed** the push interval by a
+comfortable margin, or normal jitter false-alarms. With a 1-min push, the shipped
+`STALE_MINUTES=9` gives plenty of headroom (a genuinely dead relay is detected in
+up to ~14 min: 9 + up to 5 min for the next timer tick). Tighten both together if
+you want faster detection; there's no longer a write-cost reason to slow the push.
 
-**Why only one email despite an all-day outage:** `COOLDOWN_MINUTES=360` (6 h)
-suppresses repeats of the same alert key. A persistent condition pages once, then
-goes quiet — silence after a liveness alert does **not** mean resolved.
-
-**Fix — slow the push to stay under the cap:**
-
-| Setting | Where | Value | Writes/day |
-|---------|-------|-------|-----------|
-| `RELAY_METRICS_PUSH_MS` | relay env (`/etc/iterm2-companion-relay-cf.env`) | `240000` (4 min) | 360 (push) |
-| `STALE_MINUTES` | `monitor/wrangler.jsonc` | `9` | — |
-
-New total ≈ **648 writes/day** (push + cron), leaving headroom under 1000 for
-other projects. Trade-off: a genuinely dead relay is now detected in up to
-~14 min (`STALE_MINUTES` 9 + up to 5 min for the next cron) instead of ~6.
-
-Rules of thumb:
-- `STALE_MINUTES` **must exceed** the push interval by a comfortable margin, or
-  normal jitter false-alarms. 4-min push ↔ 9-min stale is the tuned pair.
-- If other Workers projects on the account are write-heavy, or you want to keep
-  the tight 60 s cadence / ~6-min detection, **upgrade to Workers Paid ($5/mo)** —
-  KV goes to 1M writes/day and this class of problem disappears with no code
-  change.
-
-**Apply the fix:**
-
-```bash
-# Relay (VPS, root):
-sudo sed -i 's/^RELAY_METRICS_PUSH_MS=.*/RELAY_METRICS_PUSH_MS=240000/' \
-  /etc/iterm2-companion-relay-cf.env \
-  || echo 'RELAY_METRICS_PUSH_MS=240000' | sudo tee -a /etc/iterm2-companion-relay-cf.env
-sudo systemctl restart iterm2-companion-relay-cf
-
-# Monitor (from the machine you deploy from): set STALE_MINUTES to "9" in
-# monitor/wrangler.jsonc (it's skip-worktree — edit by hand, see below), then:
-cd monitor && wrangler deploy
-```
-
-The current day stays blind until the next 00:00 UTC reset regardless — the new
-cadence just keeps you under the cap from then on.
+**Why you might still see only one email despite an all-day outage:**
+`COOLDOWN_MINUTES=360` (6 h) suppresses repeats of the same alert key. A
+persistent condition pages once, then goes quiet. Silence after a liveness alert
+does **not** mean resolved.
 
 ---
 
@@ -190,6 +156,17 @@ proxy → WS upgrade → admission) is failing where the metrics push can't see 
   can't connect. Check the origin firewall (`ops/cloudflare-origin-firewall.sh`,
   which pins inbound to current Cloudflare IPs and goes stale as those rotate),
   the reverse proxy, and DNS/proxy status for `<relay-origin>`.
+
+**Sharded fleets: HTTP 421 on the probe is NOT a broken inbound path.** A
+distributed-mode relay answers 421 (reject-on-doubt) for any room whose bucket
+it does not own; that is the re-resolve signal working, and the same host will
+answer 101 for a room it does own. Set `SHARD_MAP_URL` in `monitor.env` (see
+`monitor.env.example`) so the probe fetches the live map and drives one
+owned-room handshake against every host the map names; do not probe a sharded
+host with a random room (it will "fail" with 421 in proportion to the ring it
+does not own). First diagnostic on any probe 421: compare a WS upgrade with a
+room the host owns vs one it does not (see `ops/SHARDING.md`); symmetric
+101/421 means the host is healthy and the prober is shard-unaware.
 
 ---
 
@@ -280,31 +257,34 @@ legitimate sessions still hit it.
 
 ### Config lives locally
 
-`monitor/wrangler.jsonc` is committed as a **sanitized template** (placeholder KV
-id, `example.com` emails, empty `RELAY_PROBE_URL`) and flagged **`skip-worktree`**
-so your real values never show as a diff or get committed. Consequences:
+The monitor's config and secrets live in **`monitor.env` on the monitor box**
+(installed as `/etc/iterm2-relay-monitor.env`, the systemd `EnvironmentFile`).
+It's **gitignored**: it holds `INGEST_TOKEN`, `RESEND_API_KEY`, `ALERT_TO`, and
+`RELAY_PROBE_URL` (the relay's public origin), none of which belong in a public
+repo. Consequences:
 
-- **Never `git add` it / never clear the flag** — that would bake the KV id, your
-  alert email, and the relay's public origin into public history.
-- Edits to it (like `STALE_MINUTES`) don't travel via `git commit`/`git pull`.
-  Change per-deploy values **by hand on the machine you deploy from**.
-- Check the flag with `git ls-files -v monitor/wrangler.jsonc` (`S` = skip-
-  worktree). See what it's hiding with
-  `diff <(git show HEAD:monitor/wrangler.jsonc) monitor/wrangler.jsonc`.
-- The *rationale and defaults* that are safe to publish go in
-  `ops/relay.env.example`, which is a normal tracked file.
+- **Never commit `monitor.env`** — that would leak the shared push token, your
+  Resend key, and the relay's public origin.
+- Per-deploy values (like `STALE_MINUTES`) live only on the box. Change them
+  there and `systemctl restart iterm2-relay-monitor`; they don't travel via git.
+- The *rationale and safe defaults* are published in `monitor/monitor.env.example`
+  and `ops/relay.env.example`, both normal tracked files.
 
-### History: the old monitor
+### History: off Cloudflare
 
-There used to be a second monitor — `iterm2/Companion/RelayMonitor/`,
-Analytics-based (Cloudflare GraphQL), watching the retired Cloudflare **Worker**
-relay. It deployed to the **same Worker name** (`iterm2-relay-monitor`) and the
-**same KV namespace id** as this one, so a `wrangler deploy` from that directory
-would silently replace this push-based monitor with the wrong one. It has been
-**deleted** (recoverable from the `iterm2` repo history). If you ever see a
-monitor that does *not* emit **"no snapshot for N min"** on a relay outage, you're
-looking at that old Analytics-based worker resurrected — this push-based one is
-the only one that should be deployed under that name.
+The monitor used to be a **Cloudflare Worker + KV** (`iterm2-relay-monitor`), with
+config in a `skip-worktree` `monitor/wrangler.jsonc`. It was retired because the
+per-push KV write cost blew the free-tier daily quota every afternoon (see
+[the historical root cause](#historical-root-cause-kv-free-tier-write-cap-resolved-by-moving-off-cloudflare)),
+turning the monitor itself into a daily source of spam. The analysis logic
+(`monitor/src/monitor.js`) carried over unchanged; only the I/O shell (KV → local
+file, cron → internal timer, Workers WebSocket → the `ws` package, `fetch`
+handler → a Node HTTP server) was reimplemented.
+
+Even earlier there was an Analytics-based monitor (`iterm2/Companion/RelayMonitor/`,
+Cloudflare GraphQL) watching the original Worker relay; it has been deleted. If
+you ever see a monitor that does *not* emit **"no snapshot for N min"** on a relay
+outage, it's not this one.
 
 ### Where things are
 
@@ -316,17 +296,17 @@ the only one that should be deployed under that name.
 | Relay SQLite state (per-room quota/tickets) | `$RELAY_DB` (opaque room hashes; zero PII) |
 | Outbound push code | `host/metricspush.js`, wired in `host/server.js` |
 | On-box dashboard | `iterm2-relay-dashboard.service` → `bin/dashboard.js` (SQLite, loopback) |
-| Monitor Worker | `monitor/` → `wrangler tail iterm2-relay-monitor` |
+| Monitor service (separate box) | `iterm2-relay-monitor.service` → `journalctl -u iterm2-relay-monitor`; state in `/var/lib/iterm2-relay-monitor` |
 | Monitor analysis (unit-tested, pure) | `monitor/src/monitor.js` |
 
 ### Key constants (defaults)
 
-- Push cadence: `RELAY_METRICS_PUSH_MS` = 240000 (4 min). One KV write each.
-- Staleness window: `STALE_MINUTES` = 9. Cron cadence: `*/5` (5 min).
+- Push cadence: `RELAY_METRICS_PUSH_MS` = 60000 (1 min). Persisted to a local file
+  on the monitor (no write cap).
+- Staleness window: `STALE_MINUTES` = 9. Analysis timer: every 5 min
+  (`MONITOR_INTERVAL_MS` = 300000).
 - Alert cooldown: `COOLDOWN_MINUTES` = 360 (6 h); escalation warn→critical bypasses
   it.
-- KV free-plan write cap: **1000/day, account-wide.** Budget: push (360) + cron
-  (288) ≈ 648/day.
 - Per-room daily byte quota: `RELAY_DAILY_BYTE_QUOTA` = **8 GiB** in prod (code
   default 512 MiB). Trips → `1008 daily quota exceeded`, persisted for the rolling
   24h window; surfaced by the dashboard's **Quota closes** tile/chart
