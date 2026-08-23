@@ -29,6 +29,7 @@ Runs as a single Node process behind a TLS-terminating reverse proxy.
 - `bin/relay.js` — the process entrypoint.
 - `ops/` — systemd unit, Caddyfile, environment example, and the optional
   Cloudflare-origin firewall script.
-- `monitor/` — an optional Cloudflare Worker that watches the relay's pushed
-  aggregate metrics and emails on liveness loss, capacity, errors, or anomalies
+- `monitor/` — an optional self-hosted Node service (run it on a separate box,
+  ideally a different provider) that watches the relay's pushed aggregate metrics
+  and emails on liveness loss, capacity, errors, or anomalies
   (see [monitor/README.md](monitor/README.md)).

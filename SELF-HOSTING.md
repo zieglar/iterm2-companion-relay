@@ -232,21 +232,23 @@ a socket-lifetime histogram. **No** room names, device tags, or IPs are ever
 emitted, and there is no access logging anywhere. If a client is flapping, you'll
 see it as a spike of short-lived sockets in the histogram — a signal, not a bill.
 
-### Alerting (optional): the monitor Worker
+### Alerting (optional): the monitor service
 
 `/metrics` is localhost-only by design, so nothing is watching it while you're
-asleep. The [`monitor/`](monitor/) directory is a small **Cloudflare Worker** that
-does: the relay **pushes** its aggregate snapshot outbound to the Worker every
-~60s, the Worker stores the latest in KV, and a cron run every 5 minutes emails
-you (via Resend) on:
+asleep. The [`monitor/`](monitor/) directory is a small **self-hosted Node
+service** that does — run it on a **separate box, ideally a different hosting
+provider from the relays**, so one provider's outage can't take down both the
+relay and its watcher. The relay **pushes** its aggregate snapshot outbound to
+the monitor every ~1-4 min, the monitor stores the latest on disk, and an
+internal timer every 5 minutes emails you (via Resend) on:
 
 - **Liveness** — no snapshot within the staleness window (a dead-man's-switch: a
   down or wedged relay stops pushing, so silence itself pages you).
-- **Handshake** — an outside-in **synthetic probe**: the Worker opens a real
-  WebSocket to your public origin each run and drives a mac-park pairing
+- **Handshake** — an outside-in **synthetic probe**: the monitor opens a real
+  WebSocket to your public origin each tick and drives a mac-park pairing
   handshake. The push only proves the *process* is alive; this proves a phone
-  could actually *pair* — it exercises DNS, Cloudflare, the origin firewall, the
-  proxy, the WS upgrade, and admission, catching outages the push can't see.
+  could actually *pair* — it exercises DNS, TLS, the origin firewall, the proxy,
+  the WS upgrade, and admission, catching outages the push can't see.
 - **Capacity** — live sockets/rooms approaching your configured caps.
 - **Error rate** — HTTP 500s as a fraction of requests.
 - **Exceptions** — swallowed process exceptions between checks.
@@ -254,7 +256,7 @@ you (via Resend) on:
 
 Because the metrics transport is **outbound push**, the relay exposes no metrics endpoint
 to the internet and never reveals its origin hostname — the VPS only ever makes
-outbound calls. To enable it, deploy the Worker (see [`monitor/README.md`](monitor/README.md))
+outbound calls. To enable it, deploy the monitor (see [`monitor/README.md`](monitor/README.md))
 and set `RELAY_METRICS_PUSH_URL` + `RELAY_METRICS_PUSH_TOKEN` in the relay's env
 file. Leave them unset and the relay simply doesn't push; `/metrics` stays
 loopback-only either way.

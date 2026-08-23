@@ -1,2 +1,4 @@
 node_modules/
-.wrangler/
+# Local secrets and on-disk state (never commit these).
+monitor.env
+data/

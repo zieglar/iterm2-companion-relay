@@ -1,0 +1,70 @@
+# systemd unit for the self-hosted relay monitor.
+#
+# Install (run the monitor on a Linux box you control, ideally a DIFFERENT
+# provider from the relays):
+#   sudo mkdir -p /opt/iterm2-relay-monitor
+#   sudo cp -r monitor/* /opt/iterm2-relay-monitor/     # or git clone + cd monitor
+#   cd /opt/iterm2-relay-monitor && sudo npm ci --omit=dev
+#   sudo cp ops/iterm2-relay-monitor.service /etc/systemd/system/
+#   sudo cp monitor.env.example /etc/iterm2-relay-monitor.env   # then edit
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now iterm2-relay-monitor
+#
+# Put Caddy in front for TLS on /ingest (see ops/Caddyfile.example). Node at
+# /usr/bin/node; adjust paths as needed.
+
+[Unit]
+Description=iTerm2 relay monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/iterm2-relay-monitor
+ExecStart=/usr/bin/node src/server.js
+EnvironmentFile=/etc/iterm2-relay-monitor.env
+
+# The snapshot/state/baseline files live in a systemd-managed StateDirectory
+# owned by the DynamicUser. monitor.env sets MONITOR_STATE_DIR to match.
+StateDirectory=iterm2-relay-monitor
+StateDirectoryMode=0700
+
+# Restart on crash; a persistent watcher should always come back. Note: a fresh
+# box with no snapshot yet will emit one "relay not reporting" alert on first
+# tick until the relay's first push lands (~1 push interval) -- expected on
+# initial bring-up, not on later restarts (the last snapshot persists on disk).
+Restart=always
+RestartSec=2
+KillSignal=SIGTERM
+TimeoutStopSec=15
+
+# --- Hardening (cap the blast radius of a compromise) ---
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+# Needs outbound TCP for the metrics push consumer, the probe, and Resend.
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+# NOT MemoryDenyWriteExecute: V8's JIT needs writable->executable pages, which
+# that flag blocks (Node crashes at startup), and Restart=always would crash-loop.
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+# EPERM (not SIGSYS) for filtered syscalls so libuv's io_uring probe fails
+# gracefully instead of crash-looping the service.
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=
+# MemoryMax=256M
+# CPUQuota=50%
+
+[Install]
+WantedBy=multi-user.target

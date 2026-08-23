@@ -1,0 +1,26 @@
+# Caddy reverse proxy for the relay monitor. Terminates TLS on the monitor's own
+# public hostname and forwards to the loopback Node process. The relay pushes its
+# aggregate snapshot to https://<this-host>/ingest; the monitor's outbound probe
+# and Resend calls do not go through here.
+#
+#   sudo cp monitor/ops/Caddyfile.example /etc/caddy/Caddyfile   # merge into yours
+#   sudo systemctl reload caddy
+#
+# Use a hostname distinct from the relays (the whole point is a separate box on a
+# separate provider), e.g. monitor.iterm2.com. Ports 80+443 must be reachable for
+# the Let's Encrypt ACME challenge.
+
+monitor.iterm2.com {
+	# WebSocket upgrades are not needed here (the monitor only receives plain POST
+	# /ingest and serves the operator GET endpoints); a normal reverse_proxy is
+	# enough. /ingest is bearer-authenticated and the operator endpoints are
+	# key-gated in the app, so no extra ACL is required, but you may restrict the
+	# GET endpoints to your IP if you like.
+	reverse_proxy 127.0.0.1:8790
+
+	# Privacy parity with the relay: the monitor stores only aggregate, PII-free
+	# counts, but there is no reason to write access logs here either.
+	log {
+		output discard
+	}
+}
