@@ -1,7 +1,7 @@
 {
-  "version": 2,
+  "version": 3,
   "ranges": [
-    { "low": 0, "high": 4095, "host": "relay2.iterm2.com" },
-    { "low": 4096, "high": 65535, "host": "relay1.iterm2.com" }
+    { "low": 0, "high": 32767, "host": "relay2.iterm2.com" },
+    { "low": 32768, "high": 65535, "host": "relay1.iterm2.com" }
   ]
 }
