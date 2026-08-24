@@ -232,6 +232,17 @@ function ago(ms) {
   return h < 48 ? `${h}h` : `${Math.round(h / 24)}d`;
 }
 
+// Absolute wall-clock time in US Pacific, e.g. "22:31:14 PDT". The page only
+// re-renders every 30s, so a frozen relative "Ns ago" in the header is
+// ambiguous; an absolute stamp is not.
+function pacific(ms) {
+  return new Date(ms).toLocaleString("en-US", {
+    timeZone: "America/Los_Angeles",
+    hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
+    timeZoneName: "short",
+  });
+}
+
 const rank = (s) => (s === "crit" ? 2 : s === "warn" ? 1 : 0);
 
 function row(k, v) {
@@ -341,8 +352,8 @@ function renderDashboard(health, now, detailTpl) {
   const banner = health.mapError ? `<div class=banner>shard map fetch failed: ${esc(health.mapError)}</div>` : "";
   return `${head(`Relay fleet ${s.crit ? "⚠" : ""}`.trim(), 30)}<div class=wrap>`
     + `<header class="hdr ${overall}"><div class=big>${s.ok}/${s.total} healthy</div>`
-    + `<div class=sub>${esc(sub)}</div><div class=meta>${mapLine} &middot; updated ${ago(now - health.at)} ago`
-    + `${health.probeAt != null ? ` &middot; probes ${ago(now - health.probeAt)} ago` : ""}</div></header>`
+    + `<div class=sub>${esc(sub)}</div><div class=meta>${mapLine} &middot; updated ${esc(pacific(now))}`
+    + `${health.probeAt != null ? ` &middot; probed ${esc(pacific(health.probeAt))}` : ""}</div></header>`
     + `${banner}<div class=grid>${cards}</div></div>`;
 }
 

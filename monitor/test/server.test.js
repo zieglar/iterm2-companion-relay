@@ -223,6 +223,11 @@ describe("createServer - /dashboard (fleet health page)", () => {
     expect(html).toContain('href="https://relay1.iterm2.com/dashboard/"');
     expect(html).toContain('href="https://relay2.iterm2.com/dashboard/"');
     expect(html).toContain('target="_blank"');
+    // header shows absolute Pacific-time stamps (not a stale relative "Ns ago"),
+    // and the probe label is past tense
+    expect(html).toMatch(/updated \d{2}:\d{2}:\d{2}/);
+    expect(html).toMatch(/probed \d{2}:\d{2}:\d{2}/);
+    expect(html).not.toContain("probes ");
   });
 
   it("uses a custom DASHBOARD_URL_TEMPLATE and can disable links with an empty one", async () => {
