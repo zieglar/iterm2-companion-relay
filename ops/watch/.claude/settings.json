@@ -1,0 +1,36 @@
+{
+  "permissions": {
+    "defaultMode": "auto",
+    "allow": [
+      "Read",
+      "Grep",
+      "Glob",
+      "Write(incidents/**)",
+      "Write(state/**)",
+      "Edit(incidents/**)",
+      "Edit(state/**)",
+      "Bash(node tick.mjs *)",
+      "Bash(./notify.sh *)",
+      "Bash(curl *)",
+      "Bash(dig *)",
+      "Bash(host *)",
+      "Bash(nc *)",
+      "Bash(ping *)"
+    ],
+    "deny": [
+      "Bash(ssh *)",
+      "Bash(sudo *)",
+      "Bash(systemctl *)",
+      "Bash(service *)",
+      "Bash(kill *)",
+      "Bash(pkill *)",
+      "Bash(killall *)",
+      "Bash(rm *)",
+      "Bash(reboot *)",
+      "Bash(shutdown *)",
+      "Bash(scp *)",
+      "Bash(launchctl *)",
+      "Bash(git push *)"
+    ]
+  }
+}

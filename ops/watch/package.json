@@ -1,0 +1,10 @@
+{
+  "name": "iterm2-relay-watch",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Mac-side independent watcher for the iTerm2 companion relay fleet.",
+  "dependencies": {
+    "ws": "8.21.0"
+  }
+}
