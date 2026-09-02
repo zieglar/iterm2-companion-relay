@@ -71,7 +71,16 @@ drive the phone half or the splice - so it catches the big inbound outages (DNS,
 TLS, firewall, proxy, upgrade, basic admission), not attestation- or
 phone-specific breakage.
 
-Alerts are deduped with a per-condition cooldown (`COOLDOWN_MINUTES`); an
+The three vantage-sensitive checks (**Liveness**, **Handshake**, and the
+map-fetch `probe`) page from the monitor's own network position, so a transient
+blip on the monitor's uplink or the monitor→relay path can false-page even while
+the relay serves real users fine. They are debounced: a page requires
+`ALERT_FAIL_STREAK` **consecutive** failing ticks (default 2, so ~10 min at the
+5-min tick), and one success resets the streak. The push-derived checks
+(capacity, error rate, exceptions, anomaly) come from the relay's own metrics and
+fire on the first tick. Set `ALERT_FAIL_STREAK=1` for the old immediate behavior.
+
+Alerts are then deduped with a per-condition cooldown (`COOLDOWN_MINUTES`); an
 escalation from warning to critical bypasses the cooldown, and a condition that
 clears re-pages if it recurs.
 

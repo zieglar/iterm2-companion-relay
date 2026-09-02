@@ -316,6 +316,14 @@ export function parseConfig(env = {}) {
     minSamples,
     maxSamples: Math.max(maxSamples, minSamples),
     cooldownMs: n(env.COOLDOWN_MINUTES, 360) * 60 * 1000,
+    // The two vantage-sensitive checks (liveness, inbound probe) and the shard-map
+    // fetch page from the monitor's own network position, so a transient blip on
+    // the monitor's uplink or the monitor->relay path false-pages even while the
+    // relay serves real users fine. Require this many CONSECUTIVE failing ticks
+    // before paging; a single success resets the streak. Default 2; clamp to >=1
+    // so a blanked/0 value can't restore fire-on-first-failure. Set to 1 to keep
+    // the old immediate behavior.
+    alertFailStreak: Math.max(1, n(env.ALERT_FAIL_STREAK, 2)),
   };
 }
 

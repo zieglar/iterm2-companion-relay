@@ -408,7 +408,8 @@ describe("run() — direct mode (no shard map)", () => {
   });
 
   it("probes the single origin (random room) and raises a bare probe alert on failure", async () => {
-    const kv = fakeKV({ latest });
+    // Seed a prior failing tick so this one crosses the default debounce threshold (2).
+    const kv = fakeKV({ latest, state: { hosts: { [DIRECT_HOST]: { probeFailStreak: 1 } }, sentAt: {} } });
     const calls = [];
     const probeOne = async (url, _t, room) => {
       calls.push({ url, room });
@@ -441,7 +442,11 @@ describe("run() — fleet mode (shard map is the source of truth)", () => {
   const okProbe = async () => ({ ok: true, detail: "mac parked" });
 
   it("watches every host in the map; a host with no push gets its own liveness alert", async () => {
-    const kv = fakeKV({ "latest:relay1.iterm2.com": fresh() }); // relay2 never pushed
+    const kv = fakeKV({
+      "latest:relay1.iterm2.com": fresh(), // relay2 never pushed
+      // seed a prior stale tick for relay2 so this one crosses the debounce threshold
+      state: { hosts: { "relay2.iterm2.com": { livenessFailStreak: 1 } }, sentAt: {} },
+    });
     const probed = [];
     const probeOne = async (url, _t, room) => { probed.push({ url, room }); return okProbe(); };
     const res = await run(env(), NOW,
@@ -459,6 +464,8 @@ describe("run() — fleet mode (shard map is the source of truth)", () => {
     const kv = fakeKV({
       "latest:relay1.iterm2.com": fresh(),
       "latest:relay2.iterm2.com": fresh(),
+      // seed a prior failing probe for relay2 so this one crosses the debounce threshold
+      state: { hosts: { "relay2.iterm2.com": { probeFailStreak: 1 } }, sentAt: {} },
     });
     const probeOne = async (url) => (url.includes("relay2")
       ? { ok: false, detail: "no websocket upgrade (HTTP 421)" }
@@ -471,7 +478,10 @@ describe("run() — fleet mode (shard map is the source of truth)", () => {
   });
 
   it("treats an unfetchable map as a probe failure and falls back to known hosts for liveness", async () => {
-    const kv = fakeKV({ state: { hosts: { "relay1.iterm2.com": {} }, sentAt: {} } });
+    // Seed prior failing ticks (map fetch + relay1 liveness) so this one crosses the debounce threshold.
+    const kv = fakeKV({
+      state: { hosts: { "relay1.iterm2.com": { livenessFailStreak: 1 } }, sentAt: {}, mapFailStreak: 1 },
+    });
     let probeCalls = 0;
     const probeOne = async () => { probeCalls += 1; return okProbe(); };
     const res = await run(env(), NOW, {
@@ -529,6 +539,59 @@ describe("run() — fleet mode (shard map is the source of truth)", () => {
     expect(byHost["relay2.iterm2.com"].status).toBe("crit"); // never reported (liveness)
     expect(byHost["relay1.iterm2.com"].status).toBe("crit"); // inbound probe failing
     expect(health.summary.crit).toBe(2);
+  });
+
+  it("debounces a flapping probe: silent on the first failing tick, pages on the second", async () => {
+    const kv = fakeKV({
+      "latest:relay1.iterm2.com": fresh(),
+      "latest:relay2.iterm2.com": fresh(),
+    });
+    const failRelay2 = async (url) => (url.includes("relay2") ? { ok: false, detail: "HTTP 502" } : okProbe());
+    const deps = { dry: false, kv, sendEmail: async () => {}, fetchMap: async () => MAP, probeOne: failRelay2, roomForHost };
+
+    const first = await run(env(), NOW, deps);
+    expect(first.due).not.toContain("relay2.iterm2.com|probe"); // one blip -> no page
+    expect(JSON.parse(kv.store.get("state")).hosts["relay2.iterm2.com"].probeFailStreak).toBe(1);
+
+    const second = await run(env(), NOW + 60000, deps);
+    expect(second.due).toContain("relay2.iterm2.com|probe"); // sustained -> pages
+  });
+
+  it("a successful probe resets the streak so a later single failure is silent again", async () => {
+    const kv = fakeKV({
+      "latest:relay1.iterm2.com": fresh(),
+      "latest:relay2.iterm2.com": fresh(),
+      state: { hosts: { "relay2.iterm2.com": { probeFailStreak: 1 } }, sentAt: {} },
+    });
+    const base = { dry: false, kv, sendEmail: async () => {}, fetchMap: async () => MAP, roomForHost };
+
+    await run(env(), NOW, { ...base, probeOne: okProbe }); // success resets streak 1 -> 0
+    expect(JSON.parse(kv.store.get("state")).hosts["relay2.iterm2.com"].probeFailStreak).toBe(0);
+
+    const failRelay2 = async (url) => (url.includes("relay2") ? { ok: false, detail: "HTTP 502" } : okProbe());
+    const res = await run(env(), NOW + 60000, { ...base, probeOne: failRelay2 });
+    expect(res.due).not.toContain("relay2.iterm2.com|probe"); // back at streak 1 -> silent
+  });
+
+  it("debounces liveness: a host that stops reporting pages only after two stale ticks", async () => {
+    const kv = fakeKV({ "latest:relay1.iterm2.com": fresh() }); // relay2 never pushed
+    const deps = { dry: false, kv, sendEmail: async () => {}, fetchMap: async () => MAP, probeOne: okProbe, roomForHost };
+
+    const first = await run(env(), NOW, deps);
+    expect(first.due).not.toContain("relay2.iterm2.com|liveness");
+    const second = await run(env(), NOW, deps);
+    expect(second.due).toContain("relay2.iterm2.com|liveness");
+  });
+
+  it("ALERT_FAIL_STREAK=1 restores fire-on-first-failure", async () => {
+    const kv = fakeKV({
+      "latest:relay1.iterm2.com": fresh(),
+      "latest:relay2.iterm2.com": fresh(),
+    });
+    const failRelay2 = async (url) => (url.includes("relay2") ? { ok: false, detail: "HTTP 502" } : okProbe());
+    const res = await run({ ...env(), ALERT_FAIL_STREAK: "1" }, NOW,
+      { dry: false, kv, sendEmail: async () => {}, fetchMap: async () => MAP, probeOne: failRelay2, roomForHost });
+    expect(res.due).toContain("relay2.iterm2.com|probe"); // threshold 1 -> immediate
   });
 });
 

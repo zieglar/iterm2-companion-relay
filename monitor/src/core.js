@@ -94,7 +94,12 @@ export async function run(env, now, { dry, kv, sendEmail, fetchMap, probeOne, ro
   const summaries = [];
 
   // A map-fetch failure pages once, fleet-wide, distinct from any per-host alert.
-  if (fleet && mapError) alerts.push(probeAlert(`shard map fetch failed: ${mapError}`));
+  // Debounced (alertFailStreak): a single transient resolver hiccup shouldn't
+  // page. A clean fetch resets the streak.
+  const mapFailStreak = fleet ? (mapError ? (state.mapFailStreak || 0) + 1 : 0) : 0;
+  if (fleet && mapError && mapFailStreak >= cfg.alertFailStreak) {
+    alerts.push(probeAlert(`shard map fetch failed: ${mapError}`));
+  }
 
   for (const host of hosts) {
     const latest = await kv.get(latestKeyFor(host), "json");
@@ -109,8 +114,11 @@ export async function run(env, now, { dry, kv, sendEmail, fetchMap, probeOne, ro
       const detail = latest ? `no snapshot for ${Math.round(ageMs / 60000)} min` : "no snapshot received yet";
       const a = livenessAlert(detail);
       reasons.push(a.key);
-      alerts.push(hostAlert(host, fleet, a));
-      nextHosts[host] = hs; // preserve baselines so they resume when pushes return
+      // Debounce (alertFailStreak): a single missed push cycle (e.g. the monitor
+      // briefly couldn't receive the relay's push) shouldn't page.
+      const livenessFailStreak = (hs.livenessFailStreak || 0) + 1;
+      if (livenessFailStreak >= cfg.alertFailStreak) alerts.push(hostAlert(host, fleet, a));
+      nextHosts[host] = { ...hs, livenessFailStreak }; // preserve baselines + track the streak
     } else {
       const snap = normalizeSnapshot(latest.snapshot);
       sockets = snap.gauges.socketsLive;
@@ -122,6 +130,7 @@ export async function run(env, now, { dry, kv, sendEmail, fetchMap, probeOne, ro
       nextHosts[host] = {
         prev: snap.counters, hourAnchor: roll.anchor,
         history: analyzed.history, lastRecordedHour: analyzed.lastRecordedHour,
+        livenessFailStreak: 0, // fresh push resets the liveness streak
       };
     }
 
@@ -133,7 +142,20 @@ export async function run(env, now, { dry, kv, sendEmail, fetchMap, probeOne, ro
     } else if (!fleet && env.RELAY_PROBE_URL && probeOne) {
       probe = await probeOne(env.RELAY_PROBE_URL, cfg.probeTimeoutMs); // direct mode: random room
     }
-    if (probe && !probe.ok) { reasons.push("probe"); alerts.push(hostAlert(host, fleet, probeAlert(probe.detail))); }
+    if (probe) {
+      // Debounce (alertFailStreak): a single failed handshake over a transiently
+      // lossy path (the monitor's own uplink, which holds the probe socket open
+      // for seconds) shouldn't page while the relay serves real users fine. A
+      // success resets the streak.
+      const probeFailStreak = probe.ok ? 0 : (hs.probeFailStreak || 0) + 1;
+      nextHosts[host].probeFailStreak = probeFailStreak;
+      if (!probe.ok) {
+        reasons.push("probe");
+        if (probeFailStreak >= cfg.alertFailStreak) alerts.push(hostAlert(host, fleet, probeAlert(probe.detail)));
+      }
+    } else if (hs.probeFailStreak) {
+      nextHosts[host].probeFailStreak = hs.probeFailStreak; // probe not run this tick: preserve the streak
+    }
 
     // Per-host status for the dashboard: liveness (not reporting) or a failed
     // probe (can't pair) is critical; any other alert (capacity/errors/
@@ -166,6 +188,7 @@ export async function run(env, now, { dry, kv, sendEmail, fetchMap, probeOne, ro
   };
 
   const nextState = { hosts: nextHosts };
+  if (fleet) nextState.mapFailStreak = mapFailStreak; // debounce state for the shard-map fetch
   if (!dry) {
     let delivered = true;
     if (due.length) {
