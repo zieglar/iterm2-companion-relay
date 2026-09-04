@@ -47,9 +47,13 @@ to look (attaching can cause a resize that briefly disrupts things).
    shard map, PLUS control fetches (resolver/Cloudflare/Google) proving this Mac has
    internet. Verdict: `ok`, `some-relays-unreachable`, `all-relays-unreachable`,
    `mac-offline`, `map-unreachable`.
-2. `mac-offline` (this Mac's own internet is down) -> heartbeat holds quietly, never
-   wakes Claude, recovers automatically when the network returns. This is the biggest
-   false-alarm source and it is handled deterministically.
+2. `mac-offline` / `tick-error` / `map-unreachable` (this Mac can't get a usable read
+   of the fleet - no internet, probe error, or the shard map can't be fetched) ->
+   heartbeat holds quietly, never wakes Claude, throttles logging, recovers on its
+   own. This is the biggest false-alarm source and is handled deterministically.
+   `map-unreachable` was added here on 2026-09-03 after partial connectivity during a
+   network outage produced ~5 pointless Claude pokes (without the map, Claude can't
+   build owned-room probes anyway).
 3. Two consecutive relay-shaped failures (Mac online) -> heartbeat pokes Claude with
    `TRIAGE:`. Claude re-probes independently, cross-checks the monitor, and pages
    ONLY if the relay is genuinely unreachable from here. A blip that clears -> logged

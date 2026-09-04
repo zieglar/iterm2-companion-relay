@@ -66,7 +66,7 @@ offline=0         # 1 while this Mac itself has no working internet
 last_offline_log=0
 while true; do
   if node tick.mjs > state/tick.out 2> state/tick.err; then
-    if [ "$offline" = 1 ]; then log "network restored - this Mac is back online; resuming normal watch"; offline=0; fi
+    if [ "$offline" = 1 ]; then log "fleet readable again from this Mac; resuming normal watch"; offline=0; fi
     if [ "$incident" = 1 ]; then
       log "recovered; poking RESOLVED"
       poke "RESOLVED: relays reachable again from this Mac. Confirm, post recovery per PLAYBOOK.md, then stand down."
@@ -79,17 +79,26 @@ while true; do
 
   verdict="$(verdict_of state/tick.out)"
 
-  # This Mac's own internet is down (or the tick errored): a blind vantage, almost
-  # always local. Do NOT wake Claude or page; just wait it out and recover when the
-  # network returns. Throttle the logging so a long outage does not flood the log or
-  # the beat window: announce once on going offline, then at most every 5 minutes.
-  if [ "$verdict" = "mac-offline" ] || [ "$verdict" = "tick-error" ]; then
+  # Conditions where this Mac cannot get a usable read of the fleet, so waking
+  # Claude cannot help:
+  #   mac-offline     - this Mac has no working internet at all.
+  #   tick-error      - the probe script itself errored.
+  #   map-unreachable - the shard map (resolver) could not be fetched. Without it
+  #                     we cannot build owned-room probes to verify sharded relays,
+  #                     so a probe would false-fail; this is almost always local
+  #                     flaky/partial connectivity (observed 2026-09-03), not a
+  #                     relay outage.
+  # All are local/transient in practice: hold quietly, do NOT wake Claude or page,
+  # throttle the logging (announce once, then at most every 5 min), and recover
+  # automatically. A genuine sustained resolver outage is out of this watcher's
+  # scope (clients tolerate the map's max-age=5; the off-box monitor covers it).
+  if [ "$verdict" = "mac-offline" ] || [ "$verdict" = "tick-error" ] || [ "$verdict" = "map-unreachable" ]; then
     now="$(date +%s)"
     if [ "$offline" = 0 ]; then
-      log "this Mac has no working internet (verdict=${verdict}); holding quietly, not waking Claude. Will resume automatically when the network returns."
+      log "cannot read the fleet from here (verdict=${verdict}); holding quietly, not waking Claude. Will resume automatically when it clears."
       offline=1; last_offline_log="$now"
     elif [ $((now - last_offline_log)) -ge 300 ]; then
-      log "still offline (verdict=${verdict}); holding"
+      log "still can't read the fleet (verdict=${verdict}); holding"
       last_offline_log="$now"
     fi
     fails=0
