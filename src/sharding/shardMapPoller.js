@@ -9,11 +9,15 @@
 import { parseShardMap, validateShardMap } from "./shardMap.js";
 
 export class ShardMapPoller {
-  constructor({ url, fetchText, store, onAdopt, onError, log }) {
+  constructor({ url, fetchText, store, onAdopt, onOk, onError, log }) {
     this._url = url;
     this._fetchText = fetchText;
     this._store = store;
     this._onAdopt = onAdopt;
+    // Fires on EVERY successful fetch (adopted or not) so a caller can detect
+    // recovery from a fetch-failure streak; onAdopt alone would miss a recovery
+    // that re-fetches the same, unchanged version (the common case).
+    this._onOk = onOk;
     this._onError = onError;
     this._log = log || (() => {});
     this._timer = null;
@@ -44,6 +48,7 @@ export class ShardMapPoller {
 
     const diff = this._store.applyFetched(map);
     if (diff.adopted && this._onAdopt) this._onAdopt(map, diff);
+    if (this._onOk) this._onOk({ adopted: diff.adopted, version: map.version });
     return {
       ok: true,
       adopted: diff.adopted,

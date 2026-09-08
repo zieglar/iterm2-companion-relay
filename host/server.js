@@ -204,10 +204,73 @@ function abortUpgrade(socket, status, message) {
 
 // The distributed-mode shard-map GET. Direct HTTPS to the CDN; the on-box proxy
 // is not in this path. Injected in tests via cfg.fetchText.
+//
+// Bounded by an abort timeout well under the poll interval: without it a
+// blackholed path (silent packet drop) leaves the fetch hanging until the OS TCP
+// timeout (~minutes) with NO error thrown and NO counter bump the whole time --
+// the single worst case for after-the-fact diagnosis. A non-2xx carries the
+// status and Cloudflare's cf-ray so an edge/Worker error is later attributable.
+const SHARDMAP_FETCH_TIMEOUT_MS = 8_000; // must stay < SHARDMAP_POLL_INTERVAL_MS (10s)
 async function defaultFetchText(url) {
-  const r = await fetch(url);
-  if (!r.ok) throw new Error(`shardmap HTTP ${r.status}`);
-  return await r.text();
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), SHARDMAP_FETCH_TIMEOUT_MS);
+  try {
+    const r = await fetch(url, { signal: ac.signal });
+    if (!r.ok) {
+      const err = new Error(`shardmap HTTP ${r.status}`);
+      err.httpStatus = r.status;
+      err.cfRay = r.headers.get("cf-ray") || "";
+      throw err;
+    }
+    return await r.text();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Walk an error's .cause chain for the first errno-style code (undici hides the
+// real code -- ENOTFOUND, ETIMEDOUT, ECONNRESET, a TLS code -- under the generic
+// `TypeError: fetch failed`, in error.cause[.cause]).
+function errCode(error) {
+  let cur = error;
+  for (let depth = 0; cur && depth < 4; depth++) {
+    if (cur.code) return String(cur.code);
+    cur = cur.cause;
+  }
+  return "";
+}
+
+// classifyShardFetchError(error) -> { cause, detail }. Turns a raw fetch/parse
+// failure into a short, greppable cause so a persistent outage is attributable
+// from the journal or /metrics without a live repro. The mapping is the whole
+// point of the exercise: dns/timeout/conn/tls point at the relay->CDN path
+// (provider network, routing, resolver DNS); http_5xx WITH a cf-ray points at
+// Cloudflare/the Worker; http_4xx points at config (WAF/URL); parse points at
+// the CDN serving non-map content (usually an error page). Exported for tests.
+export function classifyShardFetchError(error) {
+  if (!error) return { cause: "other", detail: "unknown" };
+  if (typeof error.httpStatus === "number") {
+    const s = error.httpStatus;
+    const cause = s >= 500 ? "http_5xx" : s >= 400 ? "http_4xx" : "http_other";
+    return { cause, detail: error.cfRay ? `HTTP ${s} cf-ray=${error.cfRay}` : `HTTP ${s}` };
+  }
+  if (error.kind) return { cause: "parse", detail: String(error.kind) };   // ShardMapValidationError
+  if (error.name === "SyntaxError") return { cause: "parse", detail: "json" };
+  if (error.name === "AbortError") return { cause: "timeout", detail: "abort" };
+  const code = errCode(error);
+  if (code === "ENOTFOUND" || code === "EAI_AGAIN") return { cause: "dns", detail: code };
+  if (code === "ETIMEDOUT" || code === "UND_ERR_CONNECT_TIMEOUT" ||
+      code === "UND_ERR_HEADERS_TIMEOUT" || code === "UND_ERR_BODY_TIMEOUT") {
+    return { cause: "timeout", detail: code };
+  }
+  if (code === "ECONNREFUSED" || code === "ECONNRESET" || code === "EHOSTUNREACH" ||
+      code === "ENETUNREACH" || code === "EPIPE" || code === "ECONNABORTED") {
+    return { cause: "conn", detail: code };
+  }
+  if (/^(CERT_|ERR_TLS|EPROTO|DEPTH_ZERO|SELF_SIGNED|UNABLE_TO_VERIFY|ERR_SSL)/.test(code)) {
+    return { cause: "tls", detail: code };
+  }
+  return { cause: "other", detail: code || (error.message ? String(error.message).slice(0, 80) : "unknown") };
 }
 
 export function createRelay(options = {}) {
@@ -259,6 +322,45 @@ export function createRelay(options = {}) {
   // Diagnostic log for sharding events (map adopt, drain evictions, fetch
   // failures), gated on RELAY_LOG like the room logs.
   const shardLog = (m) => { if (cfg.env && cfg.env.RELAY_LOG === "true") console.log(m); };
+
+  // Shard-map fetch-failure logging: ALWAYS-ON (unlike the RELAY_LOG-gated
+  // shardLog) because a persistent fetch failure is an operational event you
+  // must be able to time and attribute after the fact -- but THROTTLED so a long
+  // outage (a poll every ~10s) cannot flood the journal. First failure logs
+  // immediately with the classified cause+detail; then a coalesced summary at
+  // most once per window; then a RECOVERED line carrying the total duration when
+  // a fetch succeeds again. Between the start line and the RECOVERED line you get
+  // exactly what was missing: when it began, how long it lasted, and why.
+  const SHARD_ERR_LOG_WINDOW_MS = 60_000;
+  let shardErrStreak = 0;  // consecutive failures since the last success
+  let shardErrSince = 0;   // ms timestamp of the first failure in this streak
+  let shardErrLastLog = 0; // ms timestamp of the last summary line emitted
+  function noteShardFetchError(error) {
+    const { cause, detail } = classifyShardFetchError(error);
+    metrics.inc("shard_map_fetch_errors_total");
+    metrics.incReason("shard_map_fetch_errors_by_cause_total", cause);
+    const now = Date.now();
+    shardErrStreak += 1;
+    if (shardErrStreak === 1) {
+      shardErrSince = now;
+      shardErrLastLog = now;
+      const pollS = (cfg.pollIntervalMs ?? SHARDMAP_POLL_INTERVAL_MS) / 1000;
+      console.warn(`relay: shardmap fetch FAILING cause=${cause} detail=${detail} ` +
+        `url=${cfg.shardMapUrl} (poll ${pollS}s; summarizing ~every ` +
+        `${SHARD_ERR_LOG_WINDOW_MS / 1000}s until recovery)`);
+    } else if (now - shardErrLastLog >= SHARD_ERR_LOG_WINDOW_MS) {
+      console.warn(`relay: shardmap fetch still FAILING cause=${cause} detail=${detail} ` +
+        `streak=${shardErrStreak} elapsed=${Math.round((now - shardErrSince) / 1000)}s`);
+      shardErrLastLog = now;
+    }
+  }
+  function noteShardFetchOk() {
+    if (shardErrStreak > 0) {
+      console.warn(`relay: shardmap fetch RECOVERED after streak=${shardErrStreak} ` +
+        `over ${Math.round((Date.now() - shardErrSince) / 1000)}s`);
+      shardErrStreak = 0;
+    }
+  }
   let shardStore = cfg.shardMapStore || null;
   let shardPoller = null;
   let shardDrain = null;
@@ -281,7 +383,8 @@ export function createRelay(options = {}) {
           `(+${diff.acquired.size} acquired, -${diff.relinquished.size} relinquished)`);
         applyShardDiff(diff);
       },
-      onError: () => metrics.inc("shard_map_fetch_errors_total"),
+      onOk: () => noteShardFetchOk(),
+      onError: (error) => noteShardFetchError(error),
       log: shardLog,
     });
   }

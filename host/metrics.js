@@ -26,6 +26,7 @@ const COUNTER_HELP = {
   shard_reject_total: "Requests rejected because this box does not own the bucket (reject-on-doubt).",
   shard_map_reloads_total: "Shard-map versions adopted (distributed mode).",
   shard_map_fetch_errors_total: "Shard-map fetches that failed (kept last-known-good).",
+  shard_map_fetch_errors_by_cause_total: "Shard-map fetch failures by cause (dns/timeout/conn/tls/http_5xx/http_4xx/parse/other), for attributing an outage after the fact.",
 };
 const GAUGE_HELP = {
   rooms_live: "Rooms currently resident in memory.",
