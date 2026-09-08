@@ -94,14 +94,40 @@ only), log a transient, and NOT page. To exercise the real page path you must ma
 relay genuinely unreachable from this Mac (e.g. /etc/hosts blackhole), which needs
 sudo and risks this Mac's own relay connection.
 
-## KNOWN GAP / TODO
+## Paging the phone (works headless)
 
-**`notify.sh` does not work yet.** It writes OSC 9 to `/dev/tty`, but Claude's Bash
-tool runs subprocesses with no controlling terminal, so the page never reaches the
-phone. A real drill confirmed this. George is providing a proper push mechanism (a
-CLI command or a URL+token to curl); rewrite `notify.sh` around it so it works from a
-headless subprocess (no tty). Until then, the "REAL outage -> page your phone" path is
-unproven end to end; triage/logging/incident-reports all work.
+`notify.sh` pages George's phone by shelling out to `~/bin/it2-notify <title> <body>`,
+a real network push. This works from Claude's Bash tool and the heartbeat (no tty
+required) - it replaced the old OSC 9 -> `/dev/tty` scheme, which could never reach a
+subprocess with no controlling terminal. Verified end to end 2026-09-08 from a
+confirmed no-tty context (both delivered).
+
+- Credentials `ITERM_PUSH_TOKEN` / `ITERM_PUSH_SECRET` live in `watch.env` (gitignored);
+  the session exports them, and `notify.sh` self-sources `watch.env` as a fallback, so
+  it works even if invoked outside the session.
+- Call it `notify.sh "TITLE" "body"` (preferred) or `notify.sh "single message"`
+  (1-arg form the playbook uses; title defaults to `relay-watch`).
+- Every page is appended to `state/notify.log`. If creds are missing it logs + prints
+  to stderr and exits non-zero rather than silently dropping the page.
+
+## Investigating a relay from here (read-only, on-box)
+
+`probe-relay.sh` is a **read-only** remote tap so triage can pull on-box data the
+external probe can't see (journal, loopback `/metrics`, unit state). The session
+hard-denies raw `ssh`/`sudo`; this wrapper is the only sanctioned path and runs a
+FIXED set of read-only commands (the LLM never composes the remote command; host/unit
+come from allowlists, timestamps are validated). Slice the RAW output LOCALLY.
+
+```
+./probe-relay.sh status                                   # systemctl show + status
+./probe-relay.sh metrics | grep -iE 'shard|fetch'         # loopback /metrics counters
+./probe-relay.sh journal --since '2026-09-07 03:00' --until '2026-09-07 07:00' \
+  | grep -iaE 'shard|resolver|fetch|econn|timeout|getaddr'   # journal window, filtered locally
+```
+
+Hosts: `interserver1` = relay1, `interserver2` = relay2 (`--host`). The relay logs
+shard-map fetch failures always-on now (cause=dns/timeout/conn/tls/http_5xx/...), so
+a shard-map-fetch alert is diagnosable from `./probe-relay.sh journal`.
 
 ## Files
 
@@ -111,9 +137,11 @@ unproven end to end; triage/logging/incident-reports all work.
 - `run.sh` - idempotent bootstrap of the tmux session
 - `ROLE.txt` - Claude's standing role prompt
 - `PLAYBOOK.md` - the triage procedure Claude follows on a `TRIAGE:` poke
-- `notify.sh` - phone page (BROKEN, see TODO)
-- `.claude/settings.json` - auto mode + hard deny list
-- `watch.env` - local config incl. `MONITOR_PASSWORD` (gitignored)
+- `notify.sh` - phone page via `~/bin/it2-notify` (works headless; see above)
+- `probe-relay.sh` - read-only on-box relay diagnostics (journal/metrics/status)
+- `.claude/settings.json` - auto mode + hard deny list (raw ssh/sudo denied; only
+  `probe-relay.sh` and read-only text filters allowed)
+- `watch.env` - local config incl. `MONITOR_PASSWORD` + `ITERM_PUSH_*` (gitignored)
 - `state/` - runtime: `heartbeat.log`, `tick.out`, `last.json`, `transients.log` (gitignored)
 - `incidents/` - incident reports Claude writes (gitignored)
 

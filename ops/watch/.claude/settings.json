@@ -15,7 +15,16 @@
       "Bash(dig *)",
       "Bash(host *)",
       "Bash(nc *)",
-      "Bash(ping *)"
+      "Bash(ping *)",
+      "Bash(./probe-relay.sh *)",
+      "Bash(grep *)",
+      "Bash(egrep *)",
+      "Bash(head *)",
+      "Bash(tail *)",
+      "Bash(wc *)",
+      "Bash(sort *)",
+      "Bash(uniq *)",
+      "Bash(cut *)"
     ],
     "deny": [
       "Bash(ssh *)",
