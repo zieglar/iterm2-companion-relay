@@ -18,6 +18,12 @@ const PLAIN = {
   relay_quota_exceeded_total: "quota_exceeded",
   relay_rooms_live: "rooms_live",
   relay_sockets_live: "sockets_live",
+  // Room occupancy (mac/phone splice state). rooms_both is the "pairings
+  // currently spliced" gauge; mac_only is a parked mac awaiting a phone;
+  // phone_only should stay 0 (a phone can't admit without a mac -- tripwire).
+  relay_rooms_both: "rooms_both",
+  relay_rooms_mac_only: "rooms_mac_only",
+  relay_rooms_phone_only: "rooms_phone_only",
   relay_socket_lifetime_seconds_sum: "life_sum",
   relay_socket_lifetime_seconds_count: "life_count",
   // Distributed-mode shard signals. A direct-mode relay renders none of these,
@@ -73,6 +79,9 @@ export function parseMetrics(text) {
     quota_exceeded: 0,
     rooms_live: 0,
     sockets_live: 0,
+    rooms_both: 0,
+    rooms_mac_only: 0,
+    rooms_phone_only: 0,
     life_sum: 0,
     life_count: 0,
     shard_reject: 0,

@@ -5,6 +5,7 @@ import { buildDashboard } from "../../dashboard/series.js";
 const row = (ts, o = {}) => ({
   ts, ws_upgrades: 0, ws_rejected: 0, http_requests: 0, http_errors: 0,
   exceptions: 0, push_errors: 0, quota_exceeded: 0, rooms_live: 0, sockets_live: 0,
+  rooms_both: 0, rooms_mac_only: 0, rooms_phone_only: 0,
   life_le1: 0, life_le5: 0, life_le15: 0, life_le60: 0, life_le300: 0, life_le1800: 0,
   life_count: 0, life_sum: 0,
   shard_reject: 0, shard_map_reloads: 0, shard_map_fetch_errors: 0,
@@ -62,6 +63,14 @@ describe("buildDashboard tiles", () => {
     const d = buildDashboard(rows, { latest: rows[0], fromMs: 0, toMs: 2000, nowMs: 2000 });
     expect(d.tiles.sockets_live).toBe(2);
     expect(d.tiles.rooms_live).toBe(3);
+  });
+
+  it("reports room occupancy (paired / mac-only / phone-only) from the latest sample", () => {
+    const rows = [row(1000, { rooms_both: 4, rooms_mac_only: 2, rooms_phone_only: 0 })];
+    const d = buildDashboard(rows, { latest: rows[0], fromMs: 0, toMs: 2000, nowMs: 2000 });
+    expect(d.tiles.rooms_both).toBe(4);
+    expect(d.tiles.rooms_mac_only).toBe(2);
+    expect(d.tiles.rooms_phone_only).toBe(0);
   });
 
   it("exposes staleness of the latest sample", () => {
@@ -160,6 +169,16 @@ describe("buildDashboard series", () => {
     // false zero).
     expect(d.series.request_rate[0].v).toBeNull();
     expect(d.series.request_rate[1].v).toBeCloseTo(60, 0);
+  });
+
+  it("bucketizes the paired-room and parked-mac occupancy gauges", () => {
+    const rows = [
+      row(0, { rooms_both: 2, rooms_mac_only: 1 }),
+      row(60000, { rooms_both: 5, rooms_mac_only: 3 }),
+    ];
+    const d = buildDashboard(rows, { latest: rows[1], fromMs: 0, toMs: 120000, nowMs: 120000, buckets: 2 });
+    expect(d.series.rooms_both.map((p) => p.v)).toEqual([2, 5]);
+    expect(d.series.rooms_mac_only.map((p) => p.v)).toEqual([1, 3]);
   });
 
   it("emits a per-minute quota-close rate series", () => {

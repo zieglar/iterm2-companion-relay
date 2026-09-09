@@ -14,6 +14,9 @@ relay_process_exceptions_total 2
 relay_quota_exceeded_total 5
 relay_rooms_live 3
 relay_sockets_live 2
+relay_rooms_both 1
+relay_rooms_mac_only 1
+relay_rooms_phone_only 0
 relay_shard_reject_total 6
 relay_shard_map_reloads_total 2
 relay_shard_map_fetch_errors_total 1
@@ -43,6 +46,9 @@ describe("parseMetrics", () => {
     expect(s.quota_exceeded).toBe(5);
     expect(s.rooms_live).toBe(3);
     expect(s.sockets_live).toBe(2);
+    expect(s.rooms_both).toBe(1);
+    expect(s.rooms_mac_only).toBe(1);
+    expect(s.rooms_phone_only).toBe(0);
   });
 
   it("sums reason-labeled rejections into a single total", () => {

@@ -141,6 +141,11 @@ const dur = (ms) => {
 const TILES = [
   { k: "sockets_live", label: "Live sockets", fmt: num },
   { k: "rooms_live", label: "Live rooms", fmt: num },
+  { k: "rooms_both", label: "Paired (mac+phone)", fmt: num, note: () => "spliced now" },
+  { k: "rooms_mac_only", label: "Parked macs", fmt: num, note: () => "awaiting phone" },
+  // Invariant tripwire: a phone can't admit without a mac, so this should be 0.
+  { k: "rooms_phone_only", label: "Phone-only", fmt: num,
+    status: (t) => t.rooms_phone_only > 0 ? "warn" : "good", note: () => "should be 0" },
   { k: "upgrades", label: "Upgrades", fmt: num, note: () => "in range" },
   { k: "requests", label: "HTTP requests", fmt: num, note: () => "in range" },
   { k: "error_pct", label: "Error rate", fmt: pct,
@@ -174,6 +179,8 @@ const TILES = [
 const CHARTS = [
   { k: "sockets_live", title: "Live sockets", color: "--blue", fmt: num },
   { k: "rooms_live", title: "Live rooms", color: "--aqua", fmt: num },
+  { k: "rooms_both", title: "Paired rooms (mac+phone)", color: "--violet", fmt: num },
+  { k: "rooms_mac_only", title: "Parked macs (no phone)", color: "--magenta", fmt: num },
   { k: "request_rate", title: "HTTP requests /min", color: "--yellow", fmt: num },
   { k: "upgrade_rate", title: "WS upgrades /min", color: "--violet", fmt: num },
   { k: "error_rate", title: "HTTP errors /min", color: "--red", fmt: num },

@@ -38,11 +38,13 @@ function bucketize(rows, fromMs, toMs, buckets) {
   const width = span / buckets;
   const idx = (ts) => Math.min(buckets - 1, Math.max(0, Math.floor((ts - fromMs) / width)));
 
-  const gaugeAcc = Array.from({ length: buckets }, () => ({ sockets: 0, rooms: 0, n: 0 }));
+  const gaugeAcc = Array.from({ length: buckets }, () => ({ sockets: 0, rooms: 0, both: 0, macOnly: 0, n: 0 }));
   for (const r of rows) {
     const b = gaugeAcc[idx(r.ts)];
     b.sockets += r.sockets_live;
     b.rooms += r.rooms_live;
+    b.both += r.rooms_both;
+    b.macOnly += r.rooms_mac_only;
     b.n += 1;
   }
 
@@ -75,6 +77,8 @@ function bucketize(rows, fromMs, toMs, buckets) {
   return {
     sockets_live: gaugeSeries((b) => b.sockets),
     rooms_live: gaugeSeries((b) => b.rooms),
+    rooms_both: gaugeSeries((b) => b.both),
+    rooms_mac_only: gaugeSeries((b) => b.macOnly),
     upgrade_rate: rateSeries("ws_upgrades"),
     request_rate: rateSeries("http_requests"),
     error_rate: rateSeries("http_errors"),
@@ -112,6 +116,11 @@ export function buildDashboard(rows, {
   const tiles = {
     sockets_live: cur ? cur.sockets_live : 0,
     rooms_live: cur ? cur.rooms_live : 0,
+    // Room occupancy right now: paired (mac+phone spliced), mac parked awaiting
+    // a phone, and the phone-only invariant tripwire (should stay 0).
+    rooms_both: cur ? (cur.rooms_both || 0) : 0,
+    rooms_mac_only: cur ? (cur.rooms_mac_only || 0) : 0,
+    rooms_phone_only: cur ? (cur.rooms_phone_only || 0) : 0,
     upgrades: windowTotal(rows, "ws_upgrades"),
     rejected: windowTotal(rows, "ws_rejected"),
     requests,

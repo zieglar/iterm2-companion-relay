@@ -30,6 +30,10 @@ const COLUMNS = [
   // that already knew the column.
   "shard_reject", "shard_map_reloads", "shard_map_fetch_errors",
   "shard_map_version", "shard_owned_buckets", "shard_draining_buckets",
+  // Room occupancy gauges (mac/phone splice state), appended likewise; old rows
+  // backfill to 0 (no occupancy history before the column existed, which reads
+  // correctly as "unknown/0 paired" for pre-upgrade time).
+  "rooms_both", "rooms_mac_only", "rooms_phone_only",
 ];
 
 // Push relay columns, in insertion order (mirrors parse.js's PUSH_FIELDS).

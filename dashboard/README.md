@@ -17,13 +17,16 @@ browser ──TLS──▶ Apache (Basic auth) ──▶ dashboard (127.0.0.1:87
 - **Health banner** — the *same* checks the off-box monitor pages on
   (`monitor/src/monitor.js`: capacity, error rate, exceptions), so the dashboard
   and the pager never disagree about "is this healthy".
-- **Tiles** — live sockets/rooms, upgrades, requests, error rate, exceptions,
-  push errors, flap % (connections closing < 1s — the Cloudflare-bill signal),
-  average lifetime, and last-sample freshness.
-- **Charts** — historical live sockets, live rooms, request/upgrade/error/rejected
-  rates (per minute, **reset-aware** so a relay restart doesn't spike them), and
-  the short-lived fraction. Range selector: 1h / 6h / 24h / 7d / 30d. Auto-refreshes
-  every 30s.
+- **Tiles** — live sockets/rooms, room occupancy (paired mac+phone / parked macs /
+  phone-only tripwire), upgrades, requests, error rate, exceptions, push errors,
+  flap % (connections closing < 1s — the Cloudflare-bill signal), average lifetime,
+  and last-sample freshness. "Paired (mac+phone)" is `relay_rooms_both`: rooms with
+  both a mac and a phone admitted (a live splice); "Phone-only" is the invariant
+  tripwire that should stay 0.
+- **Charts** — historical live sockets, live rooms, paired rooms (mac+phone),
+  parked macs, request/upgrade/error/rejected rates (per minute, **reset-aware** so
+  a relay restart doesn't spike them), and the short-lived fraction. Range selector:
+  1h / 6h / 24h / 7d / 30d. Auto-refreshes every 30s.
 
 ## Configuration (environment)
 
