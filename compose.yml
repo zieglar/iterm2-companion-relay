@@ -1,0 +1,51 @@
+services:
+  relay:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ${IMAGE_NAME:-iterm2-companion-relay}:${IMAGE_TAG:-local}
+    platform: linux/amd64
+    container_name: ${CONTAINER_NAME:-iterm2-companion-relay}
+    restart: unless-stopped
+    stop_grace_period: 30s
+    environment:
+      NODE_ENV: production
+      RELAY_HOST: 0.0.0.0
+      RELAY_PORT: "8787"
+      RELAY_DB: /data/relay.db
+      RELAY_ORIGIN: ${RELAY_ORIGIN:?set RELAY_ORIGIN in .env}
+      RELAY_TRUST_PROXY: "true"
+      ATTEST_REQUIRED: "true"
+      APP_ID: H7V7XYVQ7D.com.googlecode.iterm2.companion
+      APPATTEST_ENV: production
+      RELAY_ESTABLISHED_IDLE_TTL_MS: "2592000000"
+      RELAY_DAILY_BYTE_QUOTA: "8589934592"
+      RELAY_LOG: "false"
+      RELAY_KEEPALIVE_MS: "30000"
+    volumes:
+      - type: bind
+        source: ${RELAY_DATA_DIR:-./data}
+        target: /data
+    networks:
+      - relay-edge
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    labels:
+      traefik.enable: "true"
+      traefik.docker.network: ${TRAEFIK_NETWORK:-ecs-network}
+      traefik.http.routers.iterm-relay.rule: Host(`${RELAY_HOSTNAME:?set RELAY_HOSTNAME in .env}`)
+      traefik.http.routers.iterm-relay.entrypoints: websecure
+      traefik.http.routers.iterm-relay.tls: "true"
+      traefik.http.routers.iterm-relay.tls.certresolver: ${TRAEFIK_CERT_RESOLVER:-aliyun}
+      traefik.http.routers.iterm-relay.observability.accesslogs: "false"
+      traefik.http.services.iterm-relay.loadbalancer.server.port: "8787"
+
+networks:
+  relay-edge:
+    external: true
+    name: ${TRAEFIK_NETWORK:-ecs-network}

@@ -15,6 +15,8 @@ Runs as a single Node process behind a TLS-terminating reverse proxy.
 - **Self-host it:** see [SELF-HOSTING.md](SELF-HOSTING.md) — a guided walk-through
   for running your own relay on a VPS, with or without Cloudflare in front.
 - **Deploy (maintainer reference):** see [DEPLOY.md](DEPLOY.md).
+- **Deploy with Docker on ECS:** see
+  [docs/ECS_DOCKER_DEPLOYMENT.md](docs/ECS_DOCKER_DEPLOYMENT.md).
 - **Run locally:** `npm ci && npm start` (configure via env — see
   `ops/relay.env.example`).
 - **Test:** `npm test` (all tests run in plain Node).

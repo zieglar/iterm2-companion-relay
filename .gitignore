@@ -1,5 +1,6 @@
 node_modules/
 dist/
+.worktrees/
 *.log
 # Wrangler local state / scratch (Cloudflare dev); never commit
 .wrangler/
@@ -22,3 +23,4 @@ ops/watch/incidents/
 
 # Stray repo-root secrets file (real config lives in ops/watch/watch.env / ops/deploy.env)
 /.env
+/data/
